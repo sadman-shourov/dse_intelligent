@@ -18,8 +18,10 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
           script: |
-            cd /var/www/aria
-            git pull origin main
-            pip3 install -r requirements.txt --break-system-packages -q
-            pm2 restart aria-api
+            cd $(docker inspect dse_intelligence-aria-api-1 \
+              --format='{{index .Config.Labels "com.docker.compose.project.working_dir"}}') \
+              || cd /root
+            docker pull $(docker inspect dse_intelligence-aria-api-1 \
+              --format='{{.Config.Image}}') 2>/dev/null || true
+            docker compose -p dse_intelligence up -d --build aria-api
             echo "Deployment complete"
