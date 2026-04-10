@@ -557,7 +557,15 @@ Rules:
 - Flag urgent exits for portfolio stocks down more than 8% from avg buy
 - Be honest — if market is weak, say so
 - English only
-- Maximum 800 words total"""
+- Maximum 800 words total
+
+SELF-AWARENESS RULES:
+- You have access to your own signal accuracy data
+- If win rate < 50%: be more conservative, say "signals have been mixed recently, proceed with caution"
+- If win rate > 65%: be more confident
+- Always mention recent win rate in pulse scorecard section
+- Never hide losses — acknowledge them directly
+- If a stock you previously called BUY is now down, address it directly"""
 
 
 def build_pulse_prompt(
@@ -566,6 +574,8 @@ def build_pulse_prompt(
     watchlist: list[dict],
     trader_id: int,
     target_date: date,
+    scorecard: dict | None = None,
+    accuracy_context: str = "",
 ) -> tuple[str, str]:
     mc = analysis.get("market_context") or {}
     dsex = mc.get("dsex_index")
@@ -634,6 +644,34 @@ def build_pulse_prompt(
     lines.append(f"Stocks analysed: {total_a}")
     lines.append(f"(trader_id={trader_id})")
 
+    # Inject scorecard and accuracy context
+    if scorecard and scorecard.get("total_evaluated", 0) > 0:
+        sc = scorecard
+        lines.append("")
+        lines.append("ARIA PERFORMANCE SCORECARD:")
+        lines.append(
+            f"Win rate: {sc['win_rate']}% "
+            f"({sc['wins']} wins / {sc['losses']} losses / {sc['neutrals']} neutral "
+            f"out of {sc['total_evaluated']} evaluated)"
+        )
+        if sc.get("top_wins"):
+            lines.append("Recent wins:")
+            for w in sc["top_wins"][:3]:
+                lines.append(
+                    f"✅ {w['symbol']} {w['signal_type']} @ {w['price_at_signal']} "
+                    f"→ {w['price_at_eval']} ({w['pnl_pct']:+.1f}%)"
+                )
+        if sc.get("top_losses"):
+            lines.append("Recent losses:")
+            for l in sc["top_losses"][:3]:
+                lines.append(
+                    f"❌ {l['symbol']} {l['signal_type']} @ {l['price_at_signal']} "
+                    f"→ {l['price_at_eval']} ({l['pnl_pct']:+.1f}%)"
+                )
+    if accuracy_context:
+        lines.append("")
+        lines.append(accuracy_context)
+
     return SYSTEM_PROMPT, "\n".join(lines)
 
 
@@ -663,6 +701,7 @@ def format_telegram_message(
     analysis: dict,
     portfolio: list,
     target_date: date,
+    scorecard: dict | None = None,
 ) -> str:
     buy_count = int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or []))
     watch_count = int(analysis.get("watch_signal_total") or len(analysis.get("watch_signals") or []))
@@ -674,8 +713,35 @@ def format_telegram_message(
         "🎯 <b>ARIA Market Pulse</b>\n"
         f"📅 {html.escape(target_date.isoformat(), quote=True)} | DSE Trading Session"
     )
+
+    # ARIA accuracy scorecard section
+    sc = scorecard or {}
+    if sc.get("total_evaluated", 0) > 0:
+        scorecard_section = (
+            "\n━━━━━━━━━━━━━━━━━━\n"
+            "📈 <b>ARIA SCORECARD</b> (last 7 days)\n"
+            f"Win rate: <b>{sc['win_rate']:.0f}%</b> | "
+            f"{sc['wins']}W {sc['losses']}L {sc['neutrals']}N\n"
+            f"Avg P&amp;L: <b>{sc['avg_pnl_pct']:+.1f}%</b> per signal\n"
+        )
+        if sc.get("top_wins"):
+            scorecard_section += "\n✅ Top wins:\n"
+            for w in sc["top_wins"][:2]:
+                scorecard_section += f"• {w['symbol']}: {w['pnl_pct']:+.1f}%\n"
+        if sc.get("top_losses"):
+            scorecard_section += "\n❌ Recent losses:\n"
+            for l in sc["top_losses"][:2]:
+                scorecard_section += f"• {l['symbol']}: {l['pnl_pct']:+.1f}%\n"
+    else:
+        scorecard_section = (
+            "\n━━━━━━━━━━━━━━━━━━\n"
+            "📈 <b>ARIA SCORECARD</b>\n"
+            "Building accuracy baseline — first week of live signals.\n"
+        )
+
     score = (
-        "\n\n━━━━━━━━━━━━━━━━━━\n"
+        f"{scorecard_section}"
+        "━━━━━━━━━━━━━━━━━━\n"
         "📊 <b>SCORECARD</b>\n"
         f"BUY signals: {buy_count}\n"
         f"WATCH signals: {watch_count}\n"
@@ -771,8 +837,25 @@ def generate_pulse(trader_id: int) -> dict:
 
         portfolio = get_trader_portfolio(conn, trader_id)
         watchlist = get_trader_watchlist(conn, trader_id)
+
+        # Run signal evaluation and fetch scorecard / accuracy context
+        scorecard: dict = {}
+        accuracy_context: str = ""
+        try:
+            from analysis.evaluator import (
+                evaluate_past_signals,
+                get_recent_scorecard,
+                get_accuracy_context_for_deepseek,
+            )
+            evaluate_past_signals(days_back=7)
+            scorecard = get_recent_scorecard(days=7)
+            accuracy_context = get_accuracy_context_for_deepseek()
+        except Exception as ev_err:
+            logger.warning("Evaluator error (non-fatal): %s", ev_err)
+
         system_msg, user_msg = build_pulse_prompt(
-            analysis, portfolio, watchlist, trader_id, target_date
+            analysis, portfolio, watchlist, trader_id, target_date,
+            scorecard=scorecard, accuracy_context=accuracy_context,
         )
         deepseek_input = {"system": system_msg, "user": user_msg}
 
@@ -781,7 +864,7 @@ def generate_pulse(trader_id: int) -> dict:
         except Exception as e:
             deepseek_output = f"DeepSeek API error: {e}\n{traceback.format_exc()}"
             telegram_message = format_telegram_message(
-                deepseek_output, analysis, portfolio, target_date
+                deepseek_output, analysis, portfolio, target_date, scorecard=scorecard
             )
             try:
                 _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -800,7 +883,7 @@ def generate_pulse(trader_id: int) -> dict:
             }
 
         telegram_message = format_telegram_message(
-            deepseek_output, analysis, portfolio, target_date
+            deepseek_output, analysis, portfolio, target_date, scorecard=scorecard
         )
         try:
             _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)

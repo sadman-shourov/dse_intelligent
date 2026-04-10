@@ -19,6 +19,7 @@ from ingestion.cleanup_live_ticks import cleanup_live_ticks
 from ingestion.fetch_market_summary import fetch_market_summary
 from ingestion.fetch_stock_fundamentals import fetch_stock_fundamentals
 from analysis.engine import analyse_all_symbols, analyse_symbol, detect_extreme_moves
+from analysis.evaluator import evaluate_past_signals, get_recent_scorecard, calculate_accuracy_scores
 from pulse.deepseek import generate_pulse, generate_premarket_briefing
 from pulse.telegram import deliver_pulse, deliver_premarket_briefing, send_telegram_message, deliver_extreme_move_alerts  # noqa: F401
 
@@ -355,6 +356,30 @@ def refresh_analysis():
     results["analysis"] = res if res is not None else {"status": "error", "message": err}
 
     return JSONResponse(status_code=200, content=results)
+
+
+# ---------------------------------------------------------------------------
+# Evaluate / accuracy endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/evaluate/signals")
+def evaluate_signals_endpoint():
+    result = evaluate_past_signals(days_back=7)
+    status_code = 200 if result.get("status") == "ok" else 500
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@app.get("/evaluate/scorecard")
+def get_scorecard_endpoint():
+    result = get_recent_scorecard(days=7)
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/evaluate/accuracy")
+def calculate_accuracy_endpoint():
+    result = calculate_accuracy_scores(period_days=30)
+    status_code = 200 if result.get("status") == "ok" else 500
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @app.get("/signals/today")

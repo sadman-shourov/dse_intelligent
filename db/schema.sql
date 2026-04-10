@@ -248,3 +248,41 @@ ALTER TABLE pulse_log ADD COLUMN IF NOT EXISTS trader_id BIGINT REFERENCES trade
 
 -- Remove corrupt future-dated market_summary rows
 DELETE FROM market_summary WHERE trade_date > CURRENT_DATE;
+
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    id              BIGSERIAL PRIMARY KEY,
+    symbol          VARCHAR(20) NOT NULL REFERENCES stocks_master(symbol),
+    signal_type     VARCHAR(20) NOT NULL,
+    signal_date     DATE NOT NULL,
+    price_at_signal NUMERIC(10,2),
+    eval_date       DATE,
+    price_at_eval   NUMERIC(10,2),
+    pnl_pct         NUMERIC(8,4),
+    outcome         VARCHAR(10) CHECK (outcome IN ('WIN', 'LOSS', 'NEUTRAL', 'PENDING')),
+    days_held       INTEGER,
+    signal_reason   TEXT,
+    notes           TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(symbol, signal_date, signal_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_outcomes_date
+    ON signal_outcomes(signal_date DESC);
+
+CREATE TABLE IF NOT EXISTS accuracy_scores (
+    id              BIGSERIAL PRIMARY KEY,
+    period_start    DATE NOT NULL,
+    period_end      DATE NOT NULL,
+    signal_type     VARCHAR(20),
+    total_signals   INTEGER,
+    wins            INTEGER,
+    losses          INTEGER,
+    neutrals        INTEGER,
+    win_rate        NUMERIC(5,2),
+    avg_pnl_pct     NUMERIC(8,4),
+    best_signal     VARCHAR(20),
+    worst_signal    VARCHAR(20),
+    notes           TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(period_start, period_end, signal_type)
+);
