@@ -1,0 +1,1700 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import psycopg2
+from dotenv import load_dotenv
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def get_db_connection():
+    root = _project_root()
+    load_dotenv(root / ".env")
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url or not database_url.strip():
+        raise RuntimeError("DATABASE_URL is missing or empty in .env")
+    return psycopg2.connect(database_url)
+
+
+def get_db_date(conn) -> date:
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT CURRENT_DATE")
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            raise RuntimeError("SELECT CURRENT_DATE returned no date")
+        return row[0]
+    finally:
+        cur.close()
+
+
+def get_price_history(symbol: str, days: int = 90) -> pd.DataFrame:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT date, open, high, low, close, ltp, ycp, volume, trade, value
+            FROM price_history
+            WHERE symbol = %s
+            ORDER BY date DESC
+            LIMIT %s
+            """,
+            (symbol, days),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    finally:
+        cur.close()
+        conn.close()
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "ltp", "ycp", "volume", "trade", "value"])
+
+    df = pd.DataFrame(rows, columns=cols)
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def get_latest_live_tick(symbol: str, as_of_date: date | None = None) -> list[dict]:
+    """Return all live tick sessions today for a symbol, sorted by session_no ASC."""
+    conn = get_db_connection()
+    try:
+        tick_date = as_of_date if as_of_date is not None else get_db_date(conn)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT session_no, ltp, high, low, volume,
+                       close, ycp, change_val, trade, value
+                FROM live_ticks
+                WHERE symbol = %s AND date = %s AND ltp > 0
+                ORDER BY session_no ASC
+                """,
+                (symbol, tick_date),
+            )
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    finally:
+        conn.close()
+
+    return [
+        {
+            "session_no": r[0],
+            "ltp": float(r[1]) if r[1] is not None else None,
+            "high": float(r[2]) if r[2] is not None else None,
+            "low": float(r[3]) if r[3] is not None else None,
+            "volume": int(r[4]) if r[4] is not None else 0,
+            "close": float(r[5]) if r[5] is not None else None,
+            "ycp": float(r[6]) if r[6] is not None else None,
+            "change_val": float(r[7]) if r[7] is not None else None,
+            "trade": int(r[8]) if r[8] is not None else 0,
+            "value": float(r[9]) if r[9] is not None else None,
+        }
+        for r in rows
+    ]
+
+
+def get_pe_ratio(symbol: str) -> float | None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT pe_ratio
+            FROM stock_fundamentals
+            WHERE symbol = %s
+            ORDER BY fetched_at DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except Exception:
+        return None
+
+
+def get_eps(symbol: str) -> float | None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT eps
+            FROM stock_fundamentals
+            WHERE symbol = %s
+            ORDER BY fetched_at DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except Exception:
+        return None
+
+
+def get_market_summary(dt: str | None = None) -> dict | None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        if dt is not None:
+            target = dt
+        else:
+            target = get_db_date(conn).isoformat()
+        cur.execute(
+            """
+            SELECT dsex_index, dses_index, total_volume, total_value_mn, total_trade, trade_date
+            FROM market_summary
+            WHERE trade_date = %s
+            LIMIT 1
+            """,
+            (target,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        return None
+    return {
+        "dsex_index": row[0],
+        "dses_index": row[1],
+        "total_volume": row[2],
+        "total_value_mn": row[3],
+        "total_trade": row[4],
+        "trade_date": row[5].isoformat() if row[5] is not None else target,
+    }
+
+
+def get_previous_market_summary(dt: str | None = None) -> dict | None:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        if dt is not None:
+            target = dt
+        else:
+            target = get_db_date(conn).isoformat()
+        cur.execute(
+            """
+            SELECT dsex_index, dses_index, total_volume, total_value_mn, total_trade, trade_date
+            FROM market_summary
+            WHERE trade_date < %s
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            (target,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        return None
+    return {
+        "dsex_index": row[0],
+        "dses_index": row[1],
+        "total_volume": row[2],
+        "total_value_mn": row[3],
+        "total_trade": row[4],
+        "trade_date": row[5].isoformat() if row[5] is not None else None,
+    }
+
+
+def bulk_fetch_price_history(days: int = 90) -> dict[str, pd.DataFrame]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # pass days as integer multiplier to interval
+        cur.execute(
+            """
+            SELECT symbol, date, open, high, low, close, ltp, ycp, volume, trade, value
+            FROM price_history
+            WHERE date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+            ORDER BY symbol ASC, date ASC
+            """,
+            (days,),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    finally:
+        cur.close()
+        conn.close()
+
+    if not rows:
+        return {}
+
+    df = pd.DataFrame(rows, columns=cols)
+    out: dict[str, pd.DataFrame] = {}
+    for symbol, grp in df.groupby("symbol", sort=False):
+        out[str(symbol)] = grp.drop(columns=["symbol"]).reset_index(drop=True)
+    return out
+
+
+def bulk_fetch_live_ticks() -> dict[str, list[dict]]:
+    """Return all sessions today per symbol, sorted by session_no ASC."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT symbol, session_no, fetched_at,
+                   ltp, high, low, close, ycp,
+                   change_val, trade, value, volume
+            FROM live_ticks
+            WHERE date = CURRENT_DATE AND ltp > 0
+            ORDER BY symbol ASC, session_no ASC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        sym = r[0]
+        entry = {
+            "session_no": r[1],
+            "fetched_at": r[2],
+            "ltp": float(r[3]) if r[3] is not None else None,
+            "high": float(r[4]) if r[4] is not None else None,
+            "low": float(r[5]) if r[5] is not None else None,
+            "close": float(r[6]) if r[6] is not None else None,
+            "ycp": float(r[7]) if r[7] is not None else None,
+            "change_val": float(r[8]) if r[8] is not None else None,
+            "trade": int(r[9]) if r[9] is not None else 0,
+            "value": float(r[10]) if r[10] is not None else None,
+            "volume": int(r[11]) if r[11] is not None else 0,
+        }
+        out.setdefault(sym, []).append(entry)
+    return out
+
+
+def bulk_fetch_pe_ratios() -> dict[str, float | None]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (symbol) symbol, pe_ratio
+            FROM stock_fundamentals
+            ORDER BY symbol, fetched_at DESC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    out: dict[str, float | None] = {}
+    for sym, pe in rows:
+        if pe is None:
+            out[sym] = None
+        else:
+            try:
+                out[sym] = float(pe)
+            except Exception:
+                out[sym] = None
+    return out
+
+
+def bulk_fetch_eps() -> dict[str, float | None]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (symbol) symbol, eps
+            FROM stock_fundamentals
+            ORDER BY symbol, fetched_at DESC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    out: dict[str, float | None] = {}
+    for sym, eps in rows:
+        if eps is None:
+            out[sym] = None
+        else:
+            try:
+                out[sym] = float(eps)
+            except Exception:
+                out[sym] = None
+    return out
+
+
+def bulk_fetch_stock_metadata() -> dict[str, dict]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT symbol, is_dsex
+            FROM stocks_master
+            WHERE is_active = TRUE
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    return {str(r[0]): {"is_dsex": bool(r[1]) if r[1] is not None else False} for r in rows}
+
+
+def get_is_dsex(symbol: str) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT is_dsex
+            FROM stocks_master
+            WHERE symbol = %s AND is_active = TRUE
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row or row[0] is None:
+        return False
+    return bool(row[0])
+
+
+def bulk_fetch_market_summary() -> tuple[dict | None, dict | None]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT trade_date, dsex_index, dses_index, total_volume, total_value_mn, total_trade
+            FROM market_summary
+            ORDER BY trade_date DESC
+            LIMIT 2
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    def to_dict(r):
+        return {
+            "trade_date": r[0].isoformat() if r[0] is not None else None,
+            "dsex_index": r[1],
+            "dses_index": r[2],
+            "total_volume": r[3],
+            "total_value_mn": r[4],
+            "total_trade": r[5],
+        }
+
+    today_summary = to_dict(rows[0]) if len(rows) >= 1 else None
+    yesterday_summary = to_dict(rows[1]) if len(rows) >= 2 else None
+    return today_summary, yesterday_summary
+
+
+def bulk_fetch_market_context(target_date: date) -> dict:
+    """Fetch today + yesterday market summary, compute dsex_change_pct."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT trade_date, dsex_index, dses_index, total_volume, total_value_mn, total_trade
+            FROM market_summary
+            WHERE trade_date <= %s
+            ORDER BY trade_date DESC
+            LIMIT 2
+            """,
+            (target_date,),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not rows:
+        return {}
+
+    r = rows[0]
+    ctx: dict = {
+        "trade_date": r[0].isoformat() if r[0] is not None else None,
+        "dsex_index": float(r[1]) if r[1] is not None else None,
+        "dses_index": float(r[2]) if r[2] is not None else None,
+        "total_volume": int(r[3]) if r[3] is not None else None,
+        "total_value_mn": float(r[4]) if r[4] is not None else None,
+        "total_trade": int(r[5]) if r[5] is not None else None,
+        "dsex_change_pct": None,
+    }
+
+    if len(rows) >= 2:
+        prev_dsex = float(rows[1][1]) if rows[1][1] is not None else None
+        today_dsex = ctx["dsex_index"]
+        if prev_dsex and today_dsex and prev_dsex != 0:
+            ctx["dsex_change_pct"] = round((today_dsex - prev_dsex) / prev_dsex * 100, 2)
+
+    return ctx
+
+
+def _current_price(df: pd.DataFrame) -> float | None:
+    if df.empty:
+        return None
+    last = df.iloc[-1]
+    for col in ("ltp", "close", "ycp"):
+        val = last.get(col)
+        if pd.notna(val):
+            try:
+                return float(val)
+            except Exception:
+                pass
+    return None
+
+
+def validate_price_row(row: dict, symbol: str) -> bool:
+    """Return True if price row passes sanity checks."""
+    close = row.get("close") or row.get("ltp")
+    high = row.get("high")
+    low = row.get("low")
+    ycp = row.get("ycp")
+    volume = row.get("volume")
+    open_ = row.get("open")
+
+    if not close or float(close) <= 0:
+        print(f"VALIDATION FAILED {symbol}: close={close} must be > 0")
+        return False
+    close = float(close)
+    if high is not None and float(high) < close:
+        print(f"VALIDATION FAILED {symbol}: high={high} < close={close}")
+        return False
+    if low is not None and float(low) > close:
+        print(f"VALIDATION FAILED {symbol}: low={low} > close={close}")
+        return False
+    if high is not None and low is not None and float(high) < float(low):
+        print(f"VALIDATION FAILED {symbol}: high={high} < low={low}")
+        return False
+    if volume is not None and float(volume) < 0:
+        print(f"VALIDATION FAILED {symbol}: volume={volume} < 0")
+        return False
+    if open_ is not None and float(open_) <= 0:
+        print(f"VALIDATION FAILED {symbol}: open={open_} must be > 0")
+        return False
+    if ycp is not None and float(ycp) > 0:
+        pct_diff = abs(close - float(ycp)) / float(ycp) * 100
+        if pct_diff > 50:
+            print(f"VALIDATION FAILED {symbol}: close={close} is {pct_diff:.1f}% from ycp={ycp}")
+            return False
+    return True
+
+
+def build_intraday_series(live_ticks_today: list[dict] | None) -> pd.DataFrame | None:
+    """Build per-session OHLCV DataFrame from live tick list. Returns None if < 2 sessions."""
+    if not live_ticks_today or len(live_ticks_today) < 2:
+        return None
+
+    rows = []
+    prev_ltp = None
+    for tick in sorted(live_ticks_today, key=lambda t: t.get("session_no", 0)):
+        ltp = tick.get("ltp")
+        if ltp is None:
+            continue
+        open_ = prev_ltp if prev_ltp is not None else ltp
+        rows.append({
+            "session_no": tick.get("session_no"),
+            "open": open_,
+            "high": tick.get("high") or ltp,
+            "low": tick.get("low") or ltp,
+            "close": ltp,
+            "volume": tick.get("volume") or 0,
+            "value": tick.get("value") or 0,
+            "trade": tick.get("trade") or 0,
+            "change_val": tick.get("change_val") or 0,
+        })
+        prev_ltp = ltp
+
+    if len(rows) < 2:
+        return None
+    return pd.DataFrame(rows).sort_values("session_no").reset_index(drop=True)
+
+
+def calculate_intraday_momentum(intraday_df: pd.DataFrame | None) -> dict:
+    """Compute intraday trend and momentum quality from session series."""
+    unavailable = {
+        "available": False,
+        "trend": "unknown",
+        "momentum": "unknown",
+        "sessions_counted": 0,
+        "price_change_pct": None,
+        "volume_acceleration": None,
+    }
+    if intraday_df is None or len(intraday_df) < 2:
+        return unavailable
+
+    try:
+        prices = intraday_df["close"].tolist()
+        first_price = prices[0]
+        last_price = prices[-1]
+        if not first_price:
+            return unavailable
+
+        price_change_pct = (last_price - first_price) / first_price * 100
+        ups = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i - 1])
+        downs = sum(1 for i in range(1, len(prices)) if prices[i] < prices[i - 1])
+
+        if ups > downs * 1.5:
+            trend = "uptrend"
+        elif downs > ups * 1.5:
+            trend = "downtrend"
+        else:
+            trend = "sideways"
+
+        vols = intraday_df["volume"].tolist()
+        if len(vols) >= 4:
+            half = len(vols) // 2
+            early_avg = sum(vols[:half]) / half
+            late_avg = sum(vols[half:]) / (len(vols) - half)
+            vol_accel = (late_avg - early_avg) / early_avg * 100 if early_avg > 0 else 0.0
+        else:
+            vol_accel = 0.0
+
+        if trend == "uptrend" and vol_accel > 20:
+            momentum = "strong_bullish"
+        elif trend == "uptrend" and vol_accel >= 0:
+            momentum = "weak_bullish"
+        elif trend == "downtrend" and vol_accel > 20:
+            momentum = "strong_bearish"
+        elif trend == "downtrend":
+            momentum = "weak_bearish"
+        else:
+            momentum = "neutral"
+
+        return {
+            "available": True,
+            "trend": trend,
+            "momentum": momentum,
+            "sessions_counted": len(intraday_df),
+            "price_change_pct": round(price_change_pct, 2),
+            "volume_acceleration": round(vol_accel, 2),
+            "session_highs": intraday_df["high"].tolist(),
+            "session_lows": intraday_df["low"].tolist(),
+            "session_volumes": intraday_df["volume"].tolist(),
+        }
+    except Exception:
+        return unavailable
+
+
+def calculate_relative_strength(
+    symbol_change_pct: float | None,
+    market_context: dict | None,
+) -> dict:
+    """Compare stock intraday change vs DSEX change."""
+    unavailable = {"available": False, "rs_signal": "unknown"}
+    if symbol_change_pct is None or not market_context:
+        return unavailable
+
+    dsex_change = market_context.get("dsex_change_pct")
+    if dsex_change is None:
+        return unavailable
+
+    rs = symbol_change_pct - dsex_change
+    if rs > 2:
+        rs_signal = "strong_outperform"
+    elif rs > 0.5:
+        rs_signal = "outperform"
+    elif rs < -2:
+        rs_signal = "strong_underperform"
+    elif rs < -0.5:
+        rs_signal = "underperform"
+    else:
+        rs_signal = "inline"
+
+    return {
+        "available": True,
+        "stock_change_pct": round(symbol_change_pct, 2),
+        "dsex_change_pct": round(dsex_change, 2),
+        "relative_strength": round(rs, 2),
+        "rs_signal": rs_signal,
+    }
+
+
+def calculate_support_resistance(df: pd.DataFrame) -> dict:
+    try:
+        if len(df) < 11:
+            return {"status": "skipped", "support": [], "resistance": [], "current_price": _current_price(df)}
+
+        close = df["close"].astype(float).values
+        mins: list[float] = []
+        maxs: list[float] = []
+
+        for i in range(5, len(close) - 5):
+            window = close[i - 5 : i + 6]
+            c = close[i]
+            if c == np.min(window):
+                mins.append(float(c))
+            if c == np.max(window):
+                maxs.append(float(c))
+
+        def cluster(levels: list[float]) -> list[float]:
+            if not levels:
+                return []
+            levels = sorted(levels)
+            groups: list[list[float]] = [[levels[0]]]
+            for lv in levels[1:]:
+                pivot = float(np.mean(groups[-1]))
+                if pivot != 0 and abs(lv - pivot) / abs(pivot) <= 0.015:
+                    groups[-1].append(lv)
+                else:
+                    groups.append([lv])
+            return [float(np.mean(g)) for g in groups]
+
+        cp = _current_price(df)
+
+        support_clustered = sorted(cluster(mins), reverse=True)[:2]
+        resistance_clustered = sorted(cluster(maxs))[:2]
+
+        if cp is not None:
+            # Use a 0.1% tolerance so levels at exactly current price are excluded
+            tol = cp * 0.001
+            support_clustered = [s for s in support_clustered if s < cp - tol]
+            resistance_clustered = [r for r in resistance_clustered if r > cp + tol]
+
+        return {
+            "status": "ok",
+            "support": [round(x, 2) for x in support_clustered],
+            "resistance": [round(x, 2) for x in resistance_clustered],
+            "current_price": cp,
+        }
+    except Exception as e:
+        return {"status": "error", "support": [], "resistance": [], "current_price": _current_price(df), "error": str(e)}
+
+
+def detect_breakout(df: pd.DataFrame, resistance_levels: list) -> dict:
+    try:
+        cp = _current_price(df)
+        if cp is None:
+            return {
+                "status": "skipped",
+                "breakout": False,
+                "breakout_level": None,
+                "volume_confirmed": False,
+                "current_volume": None,
+                "avg_volume_20d": None,
+            }
+
+        vol_series = df["volume"].astype(float)
+        avg_vol = float(vol_series.tail(20).mean()) if len(vol_series) >= 1 else 0.0
+        curr_vol = float(vol_series.iloc[-1]) if len(vol_series) >= 1 else 0.0
+        vol_confirmed = avg_vol > 0 and curr_vol > 1.5 * avg_vol
+
+        breached = [float(r) for r in resistance_levels if cp > float(r)]
+        breakout_level = max(breached) if breached else None
+
+        breakout = breakout_level is not None and vol_confirmed
+        return {
+            "status": "ok",
+            "breakout": breakout,
+            "breakout_level": breakout_level,
+            "volume_confirmed": vol_confirmed,
+            "current_volume": int(curr_vol),
+            "avg_volume_20d": int(avg_vol),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "breakout": False,
+            "breakout_level": None,
+            "volume_confirmed": False,
+            "current_volume": None,
+            "avg_volume_20d": None,
+            "error": str(e),
+        }
+
+
+def calculate_fibonacci(df: pd.DataFrame) -> dict:
+    try:
+        if df.empty:
+            return {"status": "skipped", "high_90d": None, "low_90d": None, "levels": {}, "current_price": None, "current_zone": None}
+
+        h = float(df["high"].astype(float).max())
+        l = float(df["low"].astype(float).min())
+        diff = h - l
+        cp = _current_price(df)
+
+        levels = {
+            "0": h,
+            "23.6": h - 0.236 * diff,
+            "38.2": h - 0.382 * diff,
+            "50": h - 0.500 * diff,
+            "61.8": h - 0.618 * diff,
+            "78.6": h - 0.786 * diff,
+            "100": l,
+        }
+
+        zone = None
+        if cp is not None:
+            ordered = [levels["0"], levels["23.6"], levels["38.2"], levels["50"], levels["61.8"], levels["78.6"], levels["100"]]
+            names = ["0-23.6", "23.6-38.2", "38.2-50", "50-61.8", "61.8-78.6", "78.6-100"]
+            for i in range(len(ordered) - 1):
+                top, bot = ordered[i], ordered[i + 1]
+                if bot <= cp <= top:
+                    zone = names[i]
+                    break
+
+        return {
+            "status": "ok",
+            "high_90d": round(h, 2),
+            "low_90d": round(l, 2),
+            "levels": {k: round(v, 2) for k, v in levels.items()},
+            "current_price": cp,
+            "current_zone": zone,
+        }
+    except Exception as e:
+        return {"status": "error", "high_90d": None, "low_90d": None, "levels": {}, "current_price": _current_price(df), "current_zone": None, "error": str(e)}
+
+
+def calculate_rsi(df: pd.DataFrame, period: int = 14) -> dict:
+    try:
+        if len(df) < period + 1:
+            return {"status": "skipped", "rsi": None, "signal": "neutral", "oversold": False, "overbought": False}
+
+        close = df["close"].astype(float)
+        rsi_series = RSIIndicator(close=close, window=period).rsi()
+        rsi_val = float(rsi_series.iloc[-1])
+        oversold = rsi_val < 30
+        overbought = rsi_val > 70
+        signal = "oversold" if oversold else "overbought" if overbought else "neutral"
+
+        return {
+            "status": "ok",
+            "rsi": round(rsi_val, 2),
+            "signal": signal,
+            "oversold": oversold,
+            "overbought": overbought,
+        }
+    except Exception as e:
+        return {"status": "error", "rsi": None, "signal": "neutral", "oversold": False, "overbought": False, "error": str(e)}
+
+
+def calculate_macd(df: pd.DataFrame) -> dict:
+    try:
+        if len(df) < 35:
+            return {"status": "skipped", "macd_line": None, "signal_line": None, "histogram": None, "signal": "neutral"}
+
+        close = df["close"].astype(float)
+        m = MACD(close=close, window_fast=12, window_slow=26, window_sign=9)
+        macd_line = m.macd()
+        signal_line = m.macd_signal()
+        hist = m.macd_diff()
+
+        curr_macd, prev_macd = float(macd_line.iloc[-1]), float(macd_line.iloc[-2])
+        curr_sig, prev_sig = float(signal_line.iloc[-1]), float(signal_line.iloc[-2])
+
+        if prev_macd <= prev_sig and curr_macd > curr_sig:
+            sig = "bullish_crossover"
+        elif prev_macd >= prev_sig and curr_macd < curr_sig:
+            sig = "bearish_crossover"
+        else:
+            sig = "neutral"
+
+        return {
+            "status": "ok",
+            "macd_line": round(curr_macd, 4),
+            "signal_line": round(curr_sig, 4),
+            "histogram": round(float(hist.iloc[-1]), 4),
+            "signal": sig,
+        }
+    except Exception as e:
+        return {"status": "error", "macd_line": None, "signal_line": None, "histogram": None, "signal": "neutral", "error": str(e)}
+
+
+def calculate_volume_profile(df: pd.DataFrame) -> dict:
+    try:
+        if df.empty:
+            return {"status": "skipped", "current_volume": None, "avg_volume_20d": None, "pct_vs_avg": None, "signal": "normal"}
+
+        vol = df["volume"].astype(float)
+        curr_vol = float(vol.iloc[-1]) if len(vol) else 0.0
+        avg_vol20 = float(vol.tail(20).mean()) if len(vol) else 0.0
+
+        # Use BDT value where available and non-zero
+        use_value = False
+        if "value" in df.columns:
+            val_series = df["value"].astype(float)
+            curr_val = float(val_series.iloc[-1]) if len(val_series) else 0.0
+            avg_val20 = float(val_series.tail(20).mean()) if len(val_series) else 0.0
+            if avg_val20 > 0 and curr_val > 0:
+                use_value = True
+
+        if use_value:
+            pct = (curr_val - avg_val20) / avg_val20 * 100 if avg_val20 > 0 else 0.0
+            if avg_val20 > 0 and curr_val > 1.5 * avg_val20:
+                sig = "high"
+            elif avg_val20 > 0 and curr_val < 0.5 * avg_val20:
+                sig = "low"
+            else:
+                sig = "normal"
+            return {
+                "status": "ok",
+                "current_volume": int(curr_vol),
+                "avg_volume_20d": int(avg_vol20),
+                "current_value_mn": round(curr_val / 1_000_000, 4) if curr_val else None,
+                "avg_value_20d_mn": round(avg_val20 / 1_000_000, 4) if avg_val20 else None,
+                "pct_vs_avg": round(pct, 2),
+                "signal": sig,
+                "based_on": "value",
+            }
+
+        # Fall back to raw volume
+        pct = ((curr_vol - avg_vol20) / avg_vol20) * 100 if avg_vol20 > 0 else 0.0
+        if avg_vol20 > 0 and curr_vol > 1.5 * avg_vol20:
+            sig = "high"
+        elif avg_vol20 > 0 and curr_vol < 0.5 * avg_vol20:
+            sig = "low"
+        else:
+            sig = "normal"
+
+        return {
+            "status": "ok",
+            "current_volume": int(curr_vol),
+            "avg_volume_20d": int(avg_vol20),
+            "pct_vs_avg": round(pct, 2),
+            "signal": sig,
+            "based_on": "volume",
+        }
+    except Exception as e:
+        return {"status": "error", "current_volume": None, "avg_volume_20d": None, "pct_vs_avg": None, "signal": "normal", "error": str(e)}
+
+
+def is_mutual_fund(symbol: str) -> bool:
+    return symbol.endswith("MF") or symbol.endswith("MF1") or symbol.endswith("MF2") or "FUND" in symbol.upper()
+
+
+def is_new_listing(df: pd.DataFrame) -> bool:
+    return len(df) < 60
+
+
+def is_suspected_z_category(
+    df: pd.DataFrame,
+    pe_ratio: float | None,
+    eps: float | None,
+    is_dsex: bool,
+) -> bool:
+    if len(df) < 90:
+        return False
+
+    avg_volume = float(df["volume"].tail(20).mean())
+    trading_days = int((df["volume"] > 0).sum())
+    total_days = len(df)
+    trading_consistency = trading_days / total_days if total_days else 0.0
+
+    return all(
+        [
+            (eps is None or eps < 0),
+            (pe_ratio is None or pe_ratio < 0),
+            avg_volume < 15000,
+            not is_dsex,
+            trading_consistency < 0.40,
+        ]
+    )
+
+
+def classify_stock(
+    symbol: str,
+    df: pd.DataFrame,
+    pe_ratio: float | None,
+    eps: float | None,
+    is_dsex: bool,
+) -> tuple[str, dict]:
+    daily_returns = df["close"].astype(float).pct_change().dropna()
+    volatility = float(daily_returns.std() * (252**0.5)) if len(daily_returns) else 0.0
+    avg_volume = float(df["volume"].astype(float).tail(20).mean()) if len(df) else 0.0
+    trading_days = int((df["volume"] > 0).sum())
+    trading_consistency = trading_days / len(df) if len(df) else 0.0
+
+    flags: dict = {
+        "mutual_fund": False,
+        "new_listing": False,
+        "suspected_z_category": False,
+        "is_dsex": is_dsex,
+    }
+
+    if is_mutual_fund(symbol):
+        flags["mutual_fund"] = True
+        return ("INVESTMENT", flags)
+
+    if is_new_listing(df):
+        flags["new_listing"] = True
+        return ("TRADING", flags)
+
+    if is_suspected_z_category(df, pe_ratio, eps, is_dsex):
+        flags["suspected_z_category"] = True
+        return ("GAMBLING", flags)
+
+    is_investment = all(
+        [
+            pe_ratio is not None,
+            pe_ratio is not None and 4 <= pe_ratio <= 30,
+            eps is not None and eps > 0,
+            volatility < 0.45,
+            avg_volume > 30000,
+            trading_consistency > 0.70,
+            is_dsex,
+        ]
+    )
+    if is_investment:
+        return ("INVESTMENT", flags)
+
+    is_gambling = any(
+        [
+            volatility > 0.80,
+            avg_volume < 15000,
+            trading_consistency < 0.40,
+            all([(eps is None or eps < 0), (pe_ratio is None or pe_ratio < 0), not is_dsex]),
+        ]
+    )
+    if is_gambling:
+        return ("GAMBLING", flags)
+
+    return ("TRADING", flags)
+
+
+def determine_overall_signal(
+    sr: dict,
+    breakout: dict,
+    fib: dict,
+    rsi: dict,
+    macd: dict,
+    volume: dict,
+    stock_class: str,
+    market_summary: dict | None = None,
+    previous_market_summary: dict | None = None,
+    class_flags: dict | None = None,
+    intraday: dict | None = None,
+    rs: dict | None = None,
+    market_context: dict | None = None,
+) -> tuple[str, float]:
+    score = 50
+
+    cp = sr.get("current_price") or fib.get("current_price")
+    supports = sr.get("support", []) or []
+    resistances = sr.get("resistance", []) or []
+
+    if breakout.get("breakout"):
+        score += 15
+    if rsi.get("oversold"):
+        score += 10
+    if macd.get("signal") == "bullish_crossover":
+        score += 10
+    if volume.get("signal") == "high":
+        score += 10
+
+    if cp is not None and supports:
+        nearest_support = min(supports, key=lambda x: abs(float(cp) - float(x)))
+        if nearest_support and abs(float(cp) - float(nearest_support)) / float(nearest_support) <= 0.03:
+            score += 5
+
+    if rsi.get("overbought"):
+        score -= 15
+    if macd.get("signal") == "bearish_crossover":
+        score -= 10
+
+    if cp is not None and resistances:
+        nearest_res = min(resistances, key=lambda x: abs(float(cp) - float(x)))
+        if nearest_res and abs(float(cp) - float(nearest_res)) / float(nearest_res) <= 0.01:
+            score -= 10
+
+    if stock_class == "GAMBLING":
+        score -= 20
+
+    # Intraday momentum scoring
+    intraday = intraday or {}
+    if intraday.get("available"):
+        mom = intraday.get("momentum", "")
+        if mom == "strong_bullish":
+            score += 12
+        elif mom == "weak_bullish":
+            score += 6
+        elif mom == "strong_bearish":
+            score -= 12
+        elif mom == "weak_bearish":
+            score -= 6
+
+    # Relative strength scoring
+    rs = rs or {}
+    if rs.get("available"):
+        rs_sig = rs.get("rs_signal", "")
+        if rs_sig == "strong_outperform":
+            score += 10
+        elif rs_sig == "outperform":
+            score += 5
+        elif rs_sig == "strong_underperform":
+            score -= 10
+        elif rs_sig == "underperform":
+            score -= 5
+
+    # DSEX direction (from market_context if available, else fall back to summary pair)
+    dsex_chg = None
+    if market_context and market_context.get("dsex_change_pct") is not None:
+        dsex_chg = market_context["dsex_change_pct"]
+    elif market_summary and previous_market_summary:
+        try:
+            today_dsex = float(market_summary.get("dsex_index") or 0)
+            prev_dsex = float(previous_market_summary.get("dsex_index") or 0)
+            if prev_dsex:
+                dsex_chg = (today_dsex - prev_dsex) / prev_dsex * 100.0
+        except Exception:
+            pass
+
+    if dsex_chg is not None:
+        if dsex_chg > 1.0:
+            score += 5
+        elif dsex_chg < -1.0:
+            score -= 5
+
+    flags = class_flags or {}
+    if flags.get("mutual_fund"):
+        score = min(score, 64)
+    if flags.get("new_listing"):
+        score = min(score, 64)
+    if flags.get("suspected_z_category"):
+        score = min(score, 35)
+    if flags.get("is_dsex"):
+        score += 5
+
+    score = max(0, min(100, score))
+
+    if score >= 70:
+        signal = "BUY"
+    elif score >= 50:
+        signal = "WATCH"
+    elif score >= 30:
+        signal = "HOLD"
+    else:
+        signal = "EXIT"
+
+    return signal, round(score / 100.0, 2)
+
+
+def build_signal_reason(
+    breakout: dict,
+    rsi: dict,
+    macd: dict,
+    volume: dict,
+    sr: dict,
+    current_price: float | None,
+    class_flags: dict | None = None,
+    intraday: dict | None = None,
+    rs: dict | None = None,
+) -> str:
+    triggers: list[tuple[int, str]] = []
+
+    # Priority 1: strong intraday momentum + outperform
+    intraday = intraday or {}
+    rs = rs or {}
+    if intraday.get("available") and rs.get("available"):
+        mom = intraday.get("momentum", "")
+        rs_sig = rs.get("rs_signal", "")
+        if mom == "strong_bullish" and rs_sig in ("outperform", "strong_outperform"):
+            triggers.append((20, "Strong intraday momentum + outperforming DSEX"))
+        elif mom == "strong_bearish" and rs_sig in ("underperform", "strong_underperform"):
+            triggers.append((20, "Strong intraday selling + underperforming DSEX"))
+
+    # Priority 2: breakout + volume
+    if breakout.get("breakout"):
+        lvl = breakout.get("breakout_level")
+        avg = breakout.get("avg_volume_20d") or 0
+        cur = breakout.get("current_volume") or 0
+        mult = (float(cur) / float(avg)) if avg else 0.0
+        triggers.append((15, f"Breakout above {lvl} + volume {mult:.1f}x avg"))
+
+    # Priority 3: RSI
+    rsi_val = rsi.get("rsi")
+    if rsi.get("oversold") and rsi_val is not None:
+        triggers.append((10, f"RSI oversold ({rsi_val})"))
+    elif rsi.get("overbought") and rsi_val is not None:
+        triggers.append((10, f"RSI overbought ({rsi_val})"))
+
+    # Priority 3: MACD
+    if macd.get("signal") == "bullish_crossover":
+        triggers.append((10, "MACD bullish crossover"))
+    elif macd.get("signal") == "bearish_crossover":
+        triggers.append((10, "MACD bearish crossover"))
+
+    # Priority 4: relative strength alone
+    if rs.get("available"):
+        rs_sig = rs.get("rs_signal", "")
+        rs_val = rs.get("relative_strength", 0)
+        if rs_sig == "strong_outperform":
+            triggers.append((9, f"Outperforming DSEX by {rs_val:.1f}%"))
+        elif rs_sig == "strong_underperform":
+            triggers.append((9, f"Underperforming DSEX by {abs(rs_val):.1f}%"))
+
+    if volume.get("signal") == "high":
+        triggers.append((8, "High volume"))
+    elif volume.get("signal") == "low":
+        triggers.append((6, "Low volume"))
+
+    if current_price is not None and sr.get("resistance"):
+        nr = min(sr["resistance"], key=lambda x: abs(float(current_price) - float(x)))
+        if nr and abs(float(current_price) - float(nr)) / float(nr) <= 0.01:
+            triggers.append((9, f"Near resistance {nr}"))
+
+    if current_price is not None and sr.get("support"):
+        ns = min(sr["support"], key=lambda x: abs(float(current_price) - float(x)))
+        if ns and abs(float(current_price) - float(ns)) / float(ns) <= 0.03:
+            triggers.append((7, f"Near support {ns}"))
+
+    if not triggers:
+        base = "Technical setup mixed"
+    else:
+        triggers.sort(key=lambda x: x[0], reverse=True)
+        top = [t[1] for t in triggers[:2]]
+        base = (" + ".join(top))[:100]
+
+    flags = class_flags or {}
+    extras: list[str] = []
+    if flags.get("mutual_fund"):
+        extras.append("(MF)")
+    if flags.get("new_listing"):
+        extras.append("(new listing)")
+    if flags.get("suspected_z_category"):
+        extras.append("(Z-cat suspected)")
+    if extras:
+        return (base + " " + " ".join(extras))[:130]
+    return base
+
+
+def analyse_symbol(
+    symbol: str,
+    price_df: pd.DataFrame = None,
+    live_tick: dict = None,            # kept for back-compat; ignored if live_ticks_today provided
+    pe_ratio: float = None,
+    eps: float = None,
+    today_market: dict = None,
+    prev_market: dict = None,
+    metadata_map: dict[str, dict] | None = None,
+    target_date: date | None = None,
+    live_ticks_today: list[dict] | None = None,  # full session list (CHANGE 2/3)
+    market_context: dict | None = None,           # pre-computed context with dsex_change_pct
+) -> dict:
+    try:
+        df = price_df.copy() if price_df is not None else get_price_history(symbol, days=90)
+        if len(df) < 20:
+            return {"status": "skipped", "symbol": symbol, "reason": "insufficient data"}
+
+        if target_date is None:
+            _conn_td = get_db_connection()
+            try:
+                target_date = get_db_date(_conn_td)
+            finally:
+                _conn_td.close()
+
+        market_summary = today_market if today_market is not None else get_market_summary()
+        previous_market_summary = prev_market if prev_market is not None else get_previous_market_summary()
+
+        # Resolve live tick list — prefer explicit list, fall back to single-tick compat
+        if live_ticks_today is None:
+            if live_tick is not None:
+                live_ticks_today = [live_tick] if isinstance(live_tick, dict) else []
+            else:
+                live_ticks_today = get_latest_live_tick(symbol, as_of_date=target_date)
+
+        session_no = None
+
+        if live_ticks_today:
+            latest = live_ticks_today[-1]
+            session_no = latest.get("session_no")
+
+            # Build intraday-enhanced synthetic row
+            valid_highs = [t["high"] for t in live_ticks_today if t.get("high")]
+            valid_lows = [t["low"] for t in live_ticks_today if t.get("low")]
+            today_high = max(valid_highs) if valid_highs else latest.get("ltp")
+            today_low = min(valid_lows) if valid_lows else latest.get("ltp")
+            today_ltp = latest.get("ltp")
+            today_vol = latest.get("volume") or 0
+            today_val = latest.get("value")
+            today_trade = latest.get("trade") or 0
+            today_ycp = latest.get("ycp")
+            first_ltp = live_ticks_today[0].get("ltp") or today_ltp
+
+            if today_ltp:
+                synthetic_row: dict = {
+                    "date": target_date,
+                    "open": first_ltp,
+                    "high": today_high,
+                    "low": today_low,
+                    "close": today_ltp,
+                    "ltp": today_ltp,
+                    "ycp": today_ycp if today_ycp else (float(df["close"].iloc[-1]) if not df.empty else None),
+                    "volume": today_vol,
+                    "value": today_val,
+                    "trade": today_trade,
+                }
+                if validate_price_row(synthetic_row, symbol):
+                    df = df[df["date"] != target_date]
+                    synthetic_df = pd.DataFrame([synthetic_row])
+                    df = pd.concat([df, synthetic_df], ignore_index=True)
+                    df = df.sort_values("date").reset_index(drop=True)
+
+            intraday_df = build_intraday_series(live_ticks_today)
+        else:
+            intraday_df = None
+
+        pe = pe_ratio if pe_ratio is not None else get_pe_ratio(symbol)
+        eps_val = eps if eps is not None else get_eps(symbol)
+
+        if metadata_map is not None:
+            is_dsex_b = bool(metadata_map.get(symbol, {}).get("is_dsex", False))
+        else:
+            is_dsex_b = get_is_dsex(symbol)
+
+        sr = calculate_support_resistance(df)
+        breakout = detect_breakout(df, sr.get("resistance", []))
+        fib = calculate_fibonacci(df)
+        rsi = calculate_rsi(df)
+        macd = calculate_macd(df)
+        volume = calculate_volume_profile(df)
+
+        # New signals
+        intraday = calculate_intraday_momentum(intraday_df)
+        symbol_change_pct = None
+        if live_ticks_today:
+            latest = live_ticks_today[-1]
+            chg = latest.get("change_val")
+            ycp = latest.get("ycp")
+            if chg is not None and ycp and float(ycp) != 0:
+                symbol_change_pct = float(chg) / float(ycp) * 100
+            elif intraday.get("price_change_pct") is not None:
+                symbol_change_pct = intraday["price_change_pct"]
+
+        rs = calculate_relative_strength(symbol_change_pct, market_context)
+
+        stock_class, class_flags = classify_stock(symbol, df, pe, eps_val, is_dsex_b)
+        signal, confidence = determine_overall_signal(
+            sr,
+            breakout,
+            fib,
+            rsi,
+            macd,
+            volume,
+            stock_class,
+            market_summary,
+            previous_market_summary,
+            class_flags,
+            intraday=intraday,
+            rs=rs,
+            market_context=market_context,
+        )
+
+        analysis_date = target_date.isoformat()
+        current_price = _current_price(df)
+        reason = build_signal_reason(
+            breakout, rsi, macd, volume, sr, current_price, class_flags,
+            intraday=intraday, rs=rs,
+        )
+
+        payload = {
+            "symbol": symbol,
+            "analysis_date": analysis_date,
+            "session_no": session_no,
+            "support_levels": sr.get("support", []),
+            "resistance_levels": sr.get("resistance", []),
+            "breakout_signal": "BREAKOUT" if breakout.get("breakout") else "NONE",
+            "fib_levels": fib.get("levels", {}),
+            "rsi": rsi.get("rsi"),
+            "macd": {
+                "macd_line": macd.get("macd_line"),
+                "signal_line": macd.get("signal_line"),
+                "histogram": macd.get("histogram"),
+                "signal": macd.get("signal"),
+            },
+            "volume_signal": volume.get("signal"),
+            "stock_class": stock_class,
+            "overall_signal": signal,
+            "confidence_score": confidence,
+            "raw_output": {
+                "sr": sr,
+                "breakout": breakout,
+                "fib": fib,
+                "rsi": rsi,
+                "macd": macd,
+                "volume": volume,
+                "pe_ratio": pe,
+                "eps": eps_val,
+                "class_flags": class_flags,
+                "market_context": market_context or {"today": market_summary, "previous": previous_market_summary},
+                "intraday_momentum": intraday,
+                "relative_strength": rs,
+                "volume_profile": volume,
+                "signal_reason": reason,
+            },
+            "signal_reason": reason,
+            "price_at_signal": current_price,
+        }
+
+        return {"status": "ok", **payload}
+    except Exception as e:
+        return {"status": "error", "symbol": symbol, "reason": str(e)}
+
+
+def analyse_symbol_with_data(
+    symbol: str,
+    price_history_map: dict[str, pd.DataFrame],
+    live_ticks_map: dict[str, list[dict]],
+    pe_ratios_map: dict[str, float | None],
+    eps_map: dict[str, float | None],
+    metadata_map: dict[str, dict],
+    today_market: dict | None,
+    prev_market: dict | None,
+    target_date: date,
+    market_context: dict | None = None,
+) -> dict:
+    live_ticks_today = live_ticks_map.get(symbol, [])
+    return analyse_symbol(
+        symbol,
+        price_df=price_history_map.get(symbol),
+        pe_ratio=pe_ratios_map.get(symbol),
+        eps=eps_map.get(symbol),
+        today_market=today_market,
+        prev_market=prev_market,
+        metadata_map=metadata_map,
+        target_date=target_date,
+        live_ticks_today=live_ticks_today,
+        market_context=market_context,
+    )
+
+
+def batch_upsert_analysis_results(results: list[dict]) -> None:
+    if not results:
+        return
+    conn = get_db_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+    try:
+        sql = """
+            INSERT INTO analysis_results (
+                symbol, analysis_date, session_no,
+                support_levels, resistance_levels,
+                breakout_signal, fib_levels, rsi,
+                macd, volume_signal, stock_class,
+                overall_signal, confidence_score, raw_output
+            ) VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s, %s::jsonb, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (symbol, analysis_date, session_no)
+            DO UPDATE SET
+                support_levels = EXCLUDED.support_levels,
+                resistance_levels = EXCLUDED.resistance_levels,
+                breakout_signal = EXCLUDED.breakout_signal,
+                fib_levels = EXCLUDED.fib_levels,
+                rsi = EXCLUDED.rsi,
+                macd = EXCLUDED.macd,
+                volume_signal = EXCLUDED.volume_signal,
+                stock_class = EXCLUDED.stock_class,
+                overall_signal = EXCLUDED.overall_signal,
+                confidence_score = EXCLUDED.confidence_score,
+                raw_output = EXCLUDED.raw_output;
+        """
+        params = [
+            (
+                r["symbol"],
+                r["analysis_date"],
+                r.get("session_no"),
+                json.dumps(r.get("support_levels", [])),
+                json.dumps(r.get("resistance_levels", [])),
+                r.get("breakout_signal"),
+                json.dumps(r.get("fib_levels", {})),
+                r.get("rsi"),
+                json.dumps(r.get("macd", {})),
+                r.get("volume_signal"),
+                r.get("stock_class"),
+                r.get("overall_signal"),
+                r.get("confidence_score"),
+                json.dumps(r.get("raw_output", {})),
+            )
+            for r in results
+        ]
+        cur.executemany(sql, params)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def batch_upsert_signals(signals: list[dict]) -> None:
+    if not signals:
+        return
+
+    conn = get_db_connection()
+    conn.autocommit = True
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='signals'")
+        signal_cols = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='traders'")
+        trader_cols = {r[0] for r in cur.fetchall()}
+
+        if "trader_id" in signal_cols:
+            trader_filter = "WHERE t.is_active = TRUE" if "is_active" in trader_cols else ""
+            sql = f"""
+                INSERT INTO signals (
+                    trader_id, symbol, signal_type, signal_date,
+                    price_at_signal, reason, is_active
+                )
+                SELECT t.id, %s, %s, %s, %s, %s, TRUE
+                FROM traders t
+                {trader_filter}
+                ON CONFLICT (trader_id, symbol, signal_date, signal_type) DO UPDATE SET
+                    price_at_signal = EXCLUDED.price_at_signal,
+                    reason = EXCLUDED.reason,
+                    is_active = EXCLUDED.is_active
+            """
+            params = [
+                (
+                    s["symbol"],
+                    s["signal_type"],
+                    s["signal_date"],
+                    s.get("price_at_signal"),
+                    s.get("reason"),
+                )
+                for s in signals
+            ]
+            cur.executemany(sql, params)
+        else:
+            sql = """
+                INSERT INTO signals (
+                    symbol, signal_type, signal_date,
+                    price_at_signal, reason, is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, TRUE)
+                ON CONFLICT (symbol, signal_date, signal_type) DO UPDATE SET
+                    price_at_signal = EXCLUDED.price_at_signal,
+                    reason = EXCLUDED.reason,
+                    is_active = EXCLUDED.is_active
+            """
+            params = [
+                (
+                    s["symbol"],
+                    s["signal_type"],
+                    s["signal_date"],
+                    s.get("price_at_signal"),
+                    s.get("reason"),
+                )
+                for s in signals
+            ]
+            cur.executemany(sql, params)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def detect_extreme_moves(
+    live_ticks_map: dict[str, list[dict]],
+    threshold_pct: float = 5.0,
+) -> list[dict]:
+    """Return symbols whose latest-session change_val exceeds threshold_pct."""
+    extreme: list[dict] = []
+    for symbol, sessions in live_ticks_map.items():
+        if not sessions:
+            continue
+        latest = sessions[-1]
+        change_val = latest.get("change_val")
+        if change_val is None:
+            continue
+        try:
+            chg = float(change_val)
+        except (TypeError, ValueError):
+            continue
+        if abs(chg) >= threshold_pct:
+            extreme.append({
+                "symbol": symbol,
+                "change_pct": round(chg, 2),
+                "direction": "up" if chg > 0 else "down",
+                "current_price": latest.get("ltp"),
+                "session_no": latest.get("session_no"),
+                "volume": latest.get("volume"),
+            })
+    return sorted(extreme, key=lambda x: abs(x["change_pct"]), reverse=True)
+
+
+def _compute_session_no() -> int:
+    """Return session 1-10 during market hours, 0 outside."""
+    import pytz
+    dhaka = pytz.timezone("Asia/Dhaka")
+    now = datetime.now(dhaka)
+    if now.hour == 14 and now.minute <= 30:
+        in_session = True
+    elif 10 <= now.hour < 14:
+        in_session = True
+    else:
+        in_session = False
+    if not in_session:
+        return 0
+    session_no = ((now.hour - 10) * 2 + now.minute // 30) + 1
+    return max(1, min(10, session_no))
+
+
+def analyse_all_symbols() -> dict:
+    start = time.time()
+    run_session_no = _compute_session_no()
+
+    # cleanup signals once per run
+    conn = get_db_connection()
+    conn.autocommit = True
+    target_date = get_db_date(conn)
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM signals WHERE reason = 'auto-hold' OR reason IS NULL")
+        cur.execute(
+            "UPDATE signals SET is_active = FALSE WHERE signal_date < %s AND is_active = TRUE",
+            (target_date.isoformat(),),
+        )
+        cur.execute("SELECT symbol FROM stocks_master WHERE is_active = TRUE ORDER BY symbol ASC")
+        symbols = [r[0] for r in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+    price_history_map = bulk_fetch_price_history(90)
+    live_ticks_map = bulk_fetch_live_ticks()      # now dict[str, list[dict]]
+    pe_ratios_map = bulk_fetch_pe_ratios()
+    eps_map = bulk_fetch_eps()
+    metadata_map = bulk_fetch_stock_metadata()
+    today_mkt, prev_mkt = bulk_fetch_market_summary()
+    market_ctx = bulk_fetch_market_context(target_date)
+
+    symbols = [s for s in symbols if s in price_history_map]
+    print(f"Data loaded. Running analysis on {len(symbols)} symbols...")
+
+    total = len(symbols)
+    done = 0
+    skipped = 0
+    failed = 0
+    buy_signals = 0
+    watch_signals = 0
+    failed_symbols: dict[str, str] = {}
+
+    ok_results: list[dict] = []
+    signal_rows: list[dict] = []
+
+    analyse_fn = partial(
+        analyse_symbol_with_data,
+        price_history_map=price_history_map,
+        live_ticks_map=live_ticks_map,
+        pe_ratios_map=pe_ratios_map,
+        eps_map=eps_map,
+        metadata_map=metadata_map,
+        today_market=today_mkt,
+        prev_market=prev_mkt,
+        target_date=target_date,
+        market_context=market_ctx,
+    )
+
+    processed = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(analyse_fn, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            processed += 1
+            try:
+                result = future.result()
+                status = result.get("status")
+                if status == "ok":
+                    done += 1
+                    ok_results.append(result)
+                    sig = result.get("overall_signal")
+                    if sig == "BUY":
+                        buy_signals += 1
+                    if sig == "WATCH":
+                        watch_signals += 1
+                    if sig in ("BUY", "WATCH", "EXIT"):
+                        signal_rows.append(
+                            {
+                                "symbol": symbol,
+                                "signal_type": sig,
+                                "signal_date": result.get("analysis_date"),
+                                "price_at_signal": result.get("price_at_signal"),
+                                "reason": result.get("signal_reason"),
+                            }
+                        )
+                elif status == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+                    failed_symbols[symbol] = result.get("reason", "unknown error")
+            except Exception as e:
+                failed += 1
+                failed_symbols[symbol] = str(e)
+
+            if processed % 50 == 0:
+                print(f"[{processed}/{total}] ...")
+
+    # Enforce session_no=0 for off-hours runs so the unique constraint
+    # (symbol, analysis_date, session_no) prevents duplicate EOD rows.
+    for r in ok_results:
+        if r.get("session_no") is None:
+            r["session_no"] = run_session_no
+
+    batch_upsert_analysis_results(ok_results)
+    batch_upsert_signals(signal_rows)
+
+    elapsed = time.time() - start
+    print(f"Completed in {elapsed:.1f}s")
+
+    return {
+        "status": "ok",
+        "total": total,
+        "done": done,
+        "skipped": skipped,
+        "failed": failed,
+        "buy_signals": buy_signals,
+        "watch_signals": watch_signals,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": round(elapsed, 1),
+        "failed_symbols": failed_symbols,
+    }
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1:
+        result = analyse_symbol(sys.argv[1])
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        result = analyse_all_symbols()
+        print(json.dumps(result, indent=2, default=str))

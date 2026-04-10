@@ -1,0 +1,12 @@
+# Project-wide dependencies
+bdshare
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+pytz>=2024.1
+fastapi>=0.100.0
+uvicorn>=0.23.0
+numpy>=1.26.0
+pandas>=2.0.0
+ta>=0.11.0
+openai>=1.0.0
+httpx>=0.24.0
