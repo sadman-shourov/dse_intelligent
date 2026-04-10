@@ -907,7 +907,7 @@ def is_mutual_fund(symbol: str) -> bool:
 
 
 def is_new_listing(df: pd.DataFrame) -> bool:
-    return len(df) < 60
+    return len(df) < 30
 
 
 def is_suspected_z_category(

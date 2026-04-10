@@ -502,7 +502,7 @@ def get_stock(symbol: str):
             breakout = bool(bo.get("breakout"))
             cf = raw.get("class_flags")
             class_flags = cf if isinstance(cf, dict) else {}
-            analysis_date = ar[12].isoformat() if hasattr(ar[12], "isoformat") else str(ar[12]) if ar[12] else None
+            analysis_date = ar[12].strftime("%d %b %Y") if hasattr(ar[12], "strftime") else str(ar[12]) if ar[12] else None
 
         reason = sig[1] if sig else None
 
@@ -633,7 +633,7 @@ def get_market_summary():
         cur.close()
 
         return {
-            "date": today.isoformat(),
+            "date": today.strftime("%d %b %Y"),
             "dsex": _float(ms[1]) if ms else None,
             "dses": _float(ms[2]) if ms else None,
             "total_volume": _int(ms[3]) if ms else None,
