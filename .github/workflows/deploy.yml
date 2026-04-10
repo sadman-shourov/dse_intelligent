@@ -17,6 +17,12 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
           script: |
-            echo "Triggered from GitHub Actions"
+            cd /docker/dse_intelligence
+            git fetch origin main
+            git checkout -f origin/main
+            cp /tmp/aria.env .env 2>/dev/null || true
+            docker compose build --no-cache aria-api
+            docker compose up -d
+            sleep 5
             curl -s http://localhost:8000/health
-            echo "Current deployment is healthy"
+            echo "Deployment complete"
