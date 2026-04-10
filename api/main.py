@@ -452,6 +452,30 @@ def premarket_endpoint(trader_id: int):
 # Chatbot endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/stock/search/{query}")
+def search_symbol(query: str):
+    conn = None
+    try:
+        query = query.upper().strip()
+        pattern1 = f"%{query}%"
+        pattern2 = f"{query[:4]}%"
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT symbol FROM stocks_master WHERE symbol ILIKE %s OR symbol ILIKE %s ORDER BY symbol LIMIT 5",
+            (pattern1, pattern2),
+        )
+        matches = [row[0] for row in cur.fetchall()]
+        cur.close()
+        return {"query": query, "matches": matches}
+    except Exception as e:
+        logger.exception("search_symbol error query=%s", query)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.get("/stock/{symbol}")
 def get_stock(symbol: str):
     conn = None
