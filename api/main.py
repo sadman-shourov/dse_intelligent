@@ -303,6 +303,60 @@ def analyse_symbol_endpoint(symbol: str):
     return _run_job(lambda: analyse_symbol(symbol))
 
 
+# ---------------------------------------------------------------------------
+# Refresh endpoints
+# ---------------------------------------------------------------------------
+
+def _run_step(fn):
+    """Run a job function, return (result_dict, error_str)."""
+    try:
+        return fn(), None
+    except Exception as e:
+        return None, str(e)
+
+
+@app.post("/refresh/all")
+def refresh_all():
+    from datetime import datetime
+    results: dict = {"status": "ok", "message": "Data refreshed successfully", "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+    res, err = _run_step(fetch_market_summary)
+    results["market_summary"] = res if res is not None else {"status": "error", "message": err}
+
+    res, err = _run_step(fetch_stock_fundamentals)
+    results["fundamentals"] = res if res is not None else {"status": "error", "message": err}
+
+    res, err = _run_step(analyse_all_symbols)
+    results["analysis"] = res if res is not None else {"status": "error", "message": err}
+
+    return JSONResponse(status_code=200, content=results)
+
+
+@app.post("/refresh/prices")
+def refresh_prices():
+    from datetime import datetime
+    results: dict = {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+    res, err = _run_step(append_price_history)
+    results["prices"] = res if res is not None else {"status": "error", "message": err}
+
+    res, err = _run_step(analyse_all_symbols)
+    results["analysis"] = res if res is not None else {"status": "error", "message": err}
+
+    return JSONResponse(status_code=200, content=results)
+
+
+@app.post("/refresh/analysis")
+def refresh_analysis():
+    from datetime import datetime
+    results: dict = {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+    res, err = _run_step(analyse_all_symbols)
+    results["analysis"] = res if res is not None else {"status": "error", "message": err}
+
+    return JSONResponse(status_code=200, content=results)
+
+
 @app.get("/signals/today")
 def signals_today():
     conn = None
