@@ -77,6 +77,11 @@ def _jsonify(data: Any) -> Any:
     return json.loads(json.dumps(data, default=_serialize))
 
 
+def serialize_response(data: Any, status_code: int = 200) -> JSONResponse:
+    """Return JSONResponse with date/datetime-safe payload (ignores request body)."""
+    return JSONResponse(status_code=status_code, content=_jsonify(data))
+
+
 # ---------------------------------------------------------------------------
 # Existing job runner
 # ---------------------------------------------------------------------------
@@ -152,12 +157,12 @@ def root():
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest/sync-stocks")
-def ingest_sync_stocks():
+async def ingest_sync_stocks(request: Request):
     return _run_job(sync_stocks_master)
 
 
 @app.post("/ingest/append-price-history")
-def ingest_append_price_history():
+async def ingest_append_price_history(request: Request):
     return _run_job(append_price_history)
 
 
@@ -231,7 +236,7 @@ def ingest_live_ticks_endpoint():
 
 
 @app.post("/ingest/cleanup-live-ticks")
-def ingest_cleanup_live_ticks():
+async def ingest_cleanup_live_ticks(request: Request):
     return _run_job(cleanup_live_ticks)
 
 
@@ -302,12 +307,12 @@ def extreme_moves_endpoint(threshold_pct: float = 5.0):
 
 
 @app.post("/ingest/market-summary")
-def ingest_market_summary():
+async def ingest_market_summary(request: Request):
     return _run_job(fetch_market_summary)
 
 
 @app.post("/ingest/stock-fundamentals")
-def ingest_stock_fundamentals():
+async def ingest_stock_fundamentals(request: Request):
     return _run_job(fetch_stock_fundamentals)
 
 
@@ -316,7 +321,7 @@ def ingest_stock_fundamentals():
 # ---------------------------------------------------------------------------
 
 @app.post("/analyse/all")
-def analyse_all_endpoint():
+async def analyse_all_endpoint(request: Request):
     return _run_job(analyse_all_symbols)
 
 
@@ -384,10 +389,10 @@ def refresh_analysis():
 # ---------------------------------------------------------------------------
 
 @app.post("/evaluate/signals")
-def evaluate_signals_endpoint():
+async def evaluate_signals_endpoint(request: Request):
     result = evaluate_past_signals(days_back=7)
     status_code = 200 if result.get("status") == "ok" else 500
-    return JSONResponse(status_code=status_code, content=result)
+    return serialize_response(result, status_code=status_code)
 
 
 @app.get("/evaluate/scorecard")
@@ -397,10 +402,10 @@ def get_scorecard_endpoint():
 
 
 @app.post("/evaluate/accuracy")
-def calculate_accuracy_endpoint():
+async def calculate_accuracy_endpoint(request: Request):
     result = calculate_accuracy_scores(period_days=30)
     status_code = 200 if result.get("status") == "ok" else 500
-    return JSONResponse(status_code=status_code, content=_jsonify(result))
+    return serialize_response(result, status_code=status_code)
 
 
 @app.get("/signals/today")
@@ -456,14 +461,14 @@ def pulse_deliver_trader(trader_id: int):
 
 
 @app.post("/pulse/deliver/all")
-def pulse_deliver_all():
+async def pulse_deliver_all(request: Request):
     try:
         result = deliver_pulse()
         if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=_jsonify(result))
-        return JSONResponse(status_code=200, content=_jsonify(result))
+            return serialize_response(result, status_code=500)
+        return serialize_response(result)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/pulse/generate/{trader_id}")
@@ -480,12 +485,12 @@ def pulse_endpoint(trader_id: int):
 
 
 @app.post("/pulse/premarket/deliver/all")
-def premarket_deliver_all():
+async def premarket_deliver_all(request: Request):
     try:
         result = deliver_premarket_briefing()
-        return JSONResponse(status_code=200, content=_jsonify(result))
+        return serialize_response(result)
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/pulse/premarket/{trader_id}")
