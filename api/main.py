@@ -40,11 +40,12 @@ def _get_conn():
 
 def _get_db_date(conn) -> date:
     cur = conn.cursor()
-    try:
-        cur.execute("SELECT CURRENT_DATE")
-        return cur.fetchone()[0]
-    finally:
-        cur.close()
+    cur.execute("SELECT CURRENT_DATE")
+    row = cur.fetchone()
+    cur.close()
+    if not row or row[0] is None:
+        raise RuntimeError("SELECT CURRENT_DATE returned no date")
+    return row[0]
 
 
 def _float(v: Any) -> float | None:
@@ -405,6 +406,7 @@ def calculate_accuracy_endpoint():
 @app.get("/signals/today")
 def signals_today():
     conn = None
+    cur = None
     try:
         conn = _get_conn()
         cur = conn.cursor()
@@ -419,7 +421,6 @@ def signals_today():
             (today,),
         )
         rows = cur.fetchall()
-        cur.close()
         out: dict = {"date": today, "BUY": [], "WATCH": [], "EXIT": []}
         for st, sym, price, reason in rows:
             if st not in out:
@@ -430,7 +431,12 @@ def signals_today():
         logger.exception("signals_today error")
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if conn:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
             conn.close()
 
 
@@ -500,6 +506,7 @@ def premarket_endpoint(trader_id: int):
 @app.get("/stock/search/{query}")
 def search_symbol(query: str):
     conn = None
+    cur = None
     try:
         query = query.upper().strip()
         pattern1 = f"%{query}%"
@@ -511,19 +518,24 @@ def search_symbol(query: str):
             (pattern1, pattern2),
         )
         matches = [row[0] for row in cur.fetchall()]
-        cur.close()
         return {"query": query, "matches": matches}
     except Exception as e:
         logger.exception("search_symbol error query=%s", query)
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if conn:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
             conn.close()
 
 
 @app.get("/stock/{symbol}")
 def get_stock(symbol: str):
     conn = None
+    cur = None
     try:
         symbol = symbol.upper().strip()
         conn = _get_conn()
@@ -585,7 +597,13 @@ def get_stock(symbol: str):
             (symbol,),
         )
         sig = cur.fetchone()
-        cur.close()
+
+        cur.execute(
+            "SELECT MAX(date) FROM price_history WHERE symbol = %s",
+            (symbol,),
+        )
+        latest_price_row = cur.fetchone()
+        latest_price_date = latest_price_row[0] if latest_price_row else None
 
         current_price = None
         ycp = None
@@ -627,11 +645,6 @@ def get_stock(symbol: str):
             class_flags = cf if isinstance(cf, dict) else {}
             analysis_date = ar[12].strftime("%d %b %Y") if hasattr(ar[12], "strftime") else str(ar[12]) if ar[12] else None
 
-        cur.execute(
-            "SELECT MAX(date) FROM price_history WHERE symbol = %s",
-            (symbol,),
-        )
-        latest_price_date = cur.fetchone()[0]
         data_as_of = (
             latest_price_date.strftime("%d %b %Y")
             if latest_price_date
@@ -665,13 +678,19 @@ def get_stock(symbol: str):
         logger.exception("get_stock error symbol=%s", symbol)
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if conn:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
             conn.close()
 
 
 @app.get("/market/summary")
 def get_market_summary():
     conn = None
+    cur = None
     try:
         conn = _get_conn()
         cur = conn.cursor()
@@ -765,7 +784,6 @@ def get_market_summary():
                 "reason": reason,
             })
 
-        cur.close()
 
         return {
             "date": today.strftime("%d %b %Y"),
@@ -781,13 +799,19 @@ def get_market_summary():
         logger.exception("get_market_summary error")
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if conn:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
             conn.close()
 
 
 @app.get("/portfolio/{trader_id}")
 def get_portfolio(trader_id: int):
     conn = None
+    cur = None
     try:
         conn = _get_conn()
         cur = conn.cursor()
@@ -865,7 +889,6 @@ def get_portfolio(trader_id: int):
                 "urgent_exit": urgent_exit,
             })
 
-        cur.close()
 
         total_pnl = round(total_current_value - total_invested, 2)
         total_pnl_pct = round(total_pnl / total_invested * 100, 2) if total_invested else 0.0
@@ -887,7 +910,12 @@ def get_portfolio(trader_id: int):
         logger.exception("get_portfolio error trader_id=%s", trader_id)
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if conn:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
             conn.close()
 
 
@@ -1116,6 +1144,7 @@ async def record_sell(trader_id: int, request: Request):
 @app.get("/watchlist/{trader_id}")
 def get_watchlist(trader_id: int):
     conn = None
+    cur = None
     try:
         conn = _get_conn()
         cur = conn.cursor()
@@ -1177,13 +1206,78 @@ def get_watchlist(trader_id: int):
                 "gap_to_target_pct": gap_to_target_pct,
             })
 
-        cur.close()
         return {"trader_id": trader_id, "watchlist": watchlist}
     except Exception as e:
         logger.exception("get_watchlist error trader_id=%s", trader_id)
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if conn:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.close()
+
+
+@app.get("/trader/by-telegram/{telegram_chat_id}")
+def get_trader_by_telegram(telegram_chat_id: str):
+    conn = None
+    cur = None
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'traders'
+            """
+        )
+        tcols = {r[0] for r in cur.fetchall()}
+        if "telegram_chat_id" not in tcols:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "traders.telegram_chat_id column is not available"},
+            )
+        chat = telegram_chat_id.strip()
+        if "name" in tcols:
+            cur.execute(
+                "SELECT id, name FROM traders WHERE telegram_chat_id = %s LIMIT 1",
+                (chat,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            tid, name = row
+            return {
+                "trader_id": int(tid),
+                "name": (name or "").strip() or f"Trader {tid}",
+                "telegram_chat_id": chat,
+            }
+        cur.execute(
+            "SELECT id FROM traders WHERE telegram_chat_id = %s LIMIT 1",
+            (chat,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+        tid = row[0]
+        return {
+            "trader_id": int(tid),
+            "name": f"Trader {tid}",
+            "telegram_chat_id": chat,
+        }
+    except Exception as e:
+        logger.exception("get_trader_by_telegram chat_id=%s", telegram_chat_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
             conn.close()
 
 
