@@ -16,6 +16,12 @@ import psycopg2
 import pytz
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -528,7 +534,7 @@ def build_trader_context(preferences: dict, stock_intents: list) -> str:
         return ""
 
     context = (
-        f"TRADER PROFILE:\n"
+        f"Trader profile:\n"
         f"Name: {preferences.get('name', 'Trader')}\n"
         f"Style: {preferences.get('trading_style', 'not specified')}\n"
         f"Holding period: {preferences.get('holding_period', 'not specified')}\n"
@@ -537,7 +543,7 @@ def build_trader_context(preferences: dict, stock_intents: list) -> str:
     )
 
     if stock_intents:
-        context += "\nSTOCK-SPECIFIC INTENTS:\n"
+        context += "\nStock-specific intents:\n"
         for s in stock_intents:
             pnl_str = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "N/A"
             context += (
@@ -660,38 +666,111 @@ def get_trader_watchlist(conn, trader_id: int) -> list[dict]:
         cur.close()
 
 
-SYSTEM_PROMPT = """You are ARIA, a sharp and precise DSE (Dhaka Stock Exchange) trading intelligence assistant. You analyse technical signals and provide actionable trading guidance.
+def build_system_prompt(preferences: dict) -> str:
+    """Build system prompt dynamically from trader preferences stored in DB."""
+    raw_style = preferences.get("trading_style") or "swing"
+    trading_style = str(raw_style).strip().lower() if raw_style is not None else "swing"
+    if trading_style in ("", "not specified", "none"):
+        trading_style = "swing"
 
-Your job is to produce a concise market pulse message.
-Be direct, specific, and actionable. No fluff.
-Use numbers. Reference specific price levels.
+    raw_risk = preferences.get("risk_tolerance") or "moderate"
+    risk_tolerance = str(raw_risk).strip().lower() if raw_risk is not None else "moderate"
+    if risk_tolerance not in ("conservative", "moderate", "aggressive"):
+        risk_tolerance = "moderate"
 
-Format your response as plain text only.
-No markdown, no asterisks, no bullet symbols.
-Use plain dashes for lists. Use CAPS for emphasis.
+    holding_period = preferences.get("holding_period") or "days to weeks"
+    holding_period = str(holding_period).strip() if holding_period is not None else "days to weeks"
+    if holding_period.lower() in ("", "not specified", "none"):
+        holding_period = "days to weeks"
 
-Rules:
-- Never recommend gambling-class stocks for new buys
-- Always mention stop-loss for BUY recommendations (use -8% from entry)
-- Flag urgent exits for portfolio stocks down more than 8% from avg buy
-- Be honest — if market is weak, say so
-- English only
-- Maximum 800 words total
+    strategy_notes = str(preferences.get("strategy_notes") or "").strip()
 
-SELF-AWARENESS RULES:
-- You have access to your own signal accuracy data
-- If win rate < 50%: be more conservative, say "signals have been mixed recently, proceed with caution"
-- If win rate > 65%: be more confident
-- Always mention recent win rate in pulse scorecard section
-- Never hide losses — acknowledge them directly
-- If a stock you previously called BUY is now down, address it directly
+    prompt = """You are NexTrade, a DSE trading intelligence assistant. Generate a sharp, personalised market pulse.
 
-MARKET REGIME RULES:
-- If market trend is DOWNTREND: open with warning, recommend capital preservation, no new BUY entries
-- If market trend is WEAK: be cautious, only highest confidence BUY signals worth mentioning
-- If market trend is UPTREND: be more confident, highlight momentum opportunities
-- If market trend is STRONG: lead with bullish tone, more aggressive targets
-- Always state market trend clearly at top of pulse"""
+CRITICAL FORMATTING RULES:
+- Plain text only
+- No ALL CAPS anywhere
+- No asterisks, no markdown, no bullet symbols
+- Use plain dashes for lists
+- Sentence case throughout
+- Max 400 words
+- Always use actual price levels
+- HTML only for bold: <b>text</b>
+
+"""
+
+    if trading_style == "position":
+        prompt += f"""TRADER IS A POSITION TRADER:
+- Holding period: {holding_period}
+- Never suggest scalps or intraday trades
+- Never suggest "short-term bounce" plays
+- Focus on multi-week/month setups only
+- Exits should be at resistance zones, not arbitrary percentages
+- Respect stated HOLD intents unless there is a clear structural breakdown (price closes below major support on high volume)
+- Wider stop context — trader accepts drawdowns if thesis is intact
+
+"""
+    elif trading_style == "swing":
+        prompt += f"""TRADER IS A SWING TRADER:
+- Holding period: {holding_period}
+- Focus on 5-15 day momentum setups
+- Clear entry and exit levels required
+- Tighter stops acceptable
+
+"""
+    elif trading_style == "intraday":
+        prompt += """TRADER IS AN INTRADAY TRADER:
+- Focus on today's volume spikes and breakouts
+- Tight stops — preserve capital
+- Only high conviction setups
+
+"""
+
+    if risk_tolerance == "conservative":
+        prompt += """RISK PROFILE: CONSERVATIVE
+- Always lead with downside risk
+- Flag any position down more than 5% as requiring attention
+- Prefer capital preservation over gains
+
+"""
+    elif risk_tolerance == "moderate":
+        prompt += """RISK PROFILE: MODERATE
+- Balance risk and reward in all advice
+- Flag positions down more than 8% as urgent
+- Can hold through moderate drawdowns
+
+"""
+    elif risk_tolerance == "aggressive":
+        prompt += """RISK PROFILE: AGGRESSIVE
+- Can highlight higher risk/reward setups
+- Flag positions down more than 12% as urgent
+- Trader accepts volatility for bigger gains
+
+"""
+
+    if strategy_notes:
+        prompt += f"""TRADER'S OWN STRATEGY NOTES:
+{strategy_notes}
+Follow these rules when giving advice.
+
+"""
+
+    prompt += """STOCK INTENT RULES:
+- For each stock in trader's intents section: give personalised advice aligned with their stated plan
+- Never contradict a HOLD intent unless price has closed below major support
+- For EXIT intents: flag when bounce or resistance levels are reached
+- For WATCH intents: flag when entry conditions are met
+- Always reference trader's avg buy price and show P&L clearly
+
+RESPONSE STRUCTURE:
+1. Market overview (2 sentences, specific levels)
+2. Top 2-3 market opportunities aligned with trader's style
+3. Portfolio review — every stock in their intents with personalised one-line advice
+4. One key risk reminder
+
+"""
+
+    return prompt
 
 
 def build_pulse_prompt(
@@ -703,23 +782,19 @@ def build_pulse_prompt(
     scorecard: dict | None = None,
     accuracy_context: str = "",
     trader_context: str = "",
+    preferences: dict | None = None,
+    stock_intents: list | None = None,
 ) -> tuple[str, str]:
-    # Build personalised system message
-    personalisation = ""
-    if trader_context:
-        personalisation = f"""
-
-{trader_context}
-
-PERSONALISATION RULES:
-- If trading_style is "position": focus on multi-week setups, mention resistance-based exits, wider context, do not suggest quick flips
-- If trading_style is "swing": focus on 5-15 day momentum, clear entry/exit levels
-- If trading_style is "intraday": focus on today's volume spikes, breakouts, tight stops
-- If risk_tolerance is "conservative": always lead with downside risk before upside potential
-- If risk_tolerance is "aggressive": can highlight higher risk/reward opportunities
-- For each stock in STOCK-SPECIFIC INTENTS: align advice with stated intent and timeframe; do not contradict their stated plan unless there is a strong structural reason"""
-
-    effective_system = SYSTEM_PROMPT + personalisation
+    # Base rules from DB preferences + trader profile / intents on the system message
+    prefs = preferences or {}
+    intents = stock_intents or []
+    base_system = build_system_prompt(prefs)
+    personalisation_rules = (trader_context or "").strip()
+    if not personalisation_rules:
+        personalisation_rules = build_trader_context(prefs, intents).strip()
+    effective_system = base_system
+    if personalisation_rules:
+        effective_system = base_system + "\n\n" + personalisation_rules + "\n"
 
     mc = analysis.get("market_context") or {}
     dsex = mc.get("dsex_index")
@@ -739,9 +814,11 @@ PERSONALISATION RULES:
     # Market trend context
     trend_data = analysis.get("market_trend") or {}
     if trend_data and trend_data.get("trend", "unknown") != "unknown":
+        _td = str(trend_data.get("trend", "unknown")).replace("_", " ").strip()
+        trend_direction = _td.title() if _td else "Unknown"
         trend_line = (
-            f"MARKET TREND:\n"
-            f"Direction: {trend_data.get('trend', 'unknown').upper()}\n"
+            f"Market trend:\n"
+            f"Direction: {trend_direction}\n"
             f"Consecutive down days: {trend_data.get('consecutive_down_days', 0)}\n"
             f"5-day DSEX change: {trend_data.get('dsex_5d_change_pct', 0):+.1f}%"
         )
@@ -751,54 +828,68 @@ PERSONALISATION RULES:
     lines: list[str] = []
     lines.append(f"DATE: {target_date.isoformat()}")
     lines.append("")
-    lines.append("MARKET OVERVIEW:")
+    lines.append("Market overview:")
     lines.append(market_line)
     if trend_line:
         lines.append("")
         lines.append(trend_line)
     lines.append("")
-    lines.append(f"TOP BUY SIGNALS TODAY ({buy_total}):")
+    lines.append(f"Top buy signals today ({buy_total}):")
     for b in buys:
         cp = float(b.get("current_price") or 0.0)
         sl = cp * 0.92
         conf_pct = (b.get("confidence") or 0) * 100.0
         lines.append(
-            f"• {b.get('symbol')} ({b.get('stock_class')}) @ {cp}\n"
+            f"- {b.get('symbol')} ({b.get('stock_class')}) @ {cp}\n"
             f"  Signal: {b.get('reason')}\n"
             f"  Support: {b.get('support')} | Resistance: {b.get('resistance')}\n"
             f"  RSI: {b.get('rsi')} | Confidence: {conf_pct:.0f}%\n"
             f"  Stop-loss: {sl:.2f}"
         )
     lines.append("")
-    lines.append("WATCH LIST SIGNALS (top 5):")
+    lines.append("Watch list signals (top 5):")
     for w in watches:
-        lines.append(f"• {w.get('symbol')} @ {w.get('current_price')} — {w.get('reason')}")
+        lines.append(f"- {w.get('symbol')} @ {w.get('current_price')} — {w.get('reason')}")
     lines.append("")
-    lines.append("EXIT SIGNALS:")
+    lines.append("Exit signals:")
     for e in exits:
-        lines.append(f"• {e.get('symbol')} — {e.get('reason')}")
+        lines.append(f"- {e.get('symbol')} — {e.get('reason')}")
     lines.append("")
-    lines.append(f"TRADER PORTFOLIO ({len(portfolio)} positions):")
+    lines.append(f"Trader portfolio ({len(portfolio)} positions):")
     for p in portfolio:
         lines.append(
-            f"• {p.get('symbol')}: {p.get('quantity')} shares @ avg {p.get('avg_buy_price')}\n"
+            f"- {p.get('symbol')}: {p.get('quantity')} shares @ avg {p.get('avg_buy_price')}\n"
             f"  Current: {p.get('current_price')} | P&L: {p.get('pnl_pct'):+.1f}% ({p.get('pnl_value'):+.0f} BDT)\n"
             f"  Signal: {p.get('signal')} — {p.get('reason')}"
         )
         if (p.get("pnl_pct") or 0) <= -8.0:
-            lines.append("  ⚠️ URGENT EXIT — exceeds -8% threshold")
+            lines.append("  Note: urgent exit — position exceeds -8% drawdown threshold")
     lines.append("")
-    lines.append(f"WATCHLIST ({len(watchlist)} stocks):")
+    lines.append(f"Watchlist ({len(watchlist)} stocks):")
     for w in watchlist:
         lines.append(
-            f"• {w.get('symbol')} — Current: {w.get('current_price')} | Signal: {w.get('signal')}"
+            f"- {w.get('symbol')} — Current: {w.get('current_price')} | Signal: {w.get('signal')}"
         )
+
+    # Stock-specific intents from trader preferences
+    intents = stock_intents or []
+    if intents:
+        lines.append("")
+        lines.append(f"Trader stock intents ({len(intents)}):")
+        for s in intents:
+            pnl_str = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "N/A"
+            target = s.get("target_price")
+            stop = s.get("stop_price")
+            lines.append(
+                f"- {s['symbol']}: avg buy {s['avg_buy_price']} | now {s['current_price']} ({pnl_str}) | "
+                f"intent: {s['intent']} | target: {target} | stop: {stop} | timeframe: {s.get('timeframe', '')}"
+            )
     lines.append("")
     buy_count = int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or []))
     watch_count = int(analysis.get("watch_signal_total") or len(analysis.get("watch_signals") or []))
     exit_count = len(analysis.get("exit_signals") or [])
     total_a = analysis.get("total_analysed", 0)
-    lines.append("MARKET CLASS BREAKDOWN:")
+    lines.append("Market class breakdown:")
     lines.append(f"BUY signals: {buy_count} | WATCH: {watch_count} | EXIT: {exit_count}")
     lines.append(f"Stocks analysed: {total_a}")
     lines.append(f"(trader_id={trader_id})")
@@ -807,7 +898,7 @@ PERSONALISATION RULES:
     if scorecard and scorecard.get("total_evaluated", 0) > 0:
         sc = scorecard
         lines.append("")
-        lines.append("ARIA PERFORMANCE SCORECARD:")
+        lines.append("NexTrade performance scorecard:")
         lines.append(
             f"Win rate: {sc['win_rate']}% "
             f"({sc['wins']} wins / {sc['losses']} losses / {sc['neutrals']} neutral "
@@ -869,45 +960,43 @@ def format_telegram_message(
 
     body = html.escape(deepseek_response or "", quote=True)
     header = (
-        "🎯 <b>ARIA Market Pulse</b>\n"
+        "🎯 <b>NexTrade Market Pulse</b>\n"
         f"📅 {html.escape(target_date.isoformat(), quote=True)} | DSE Trading Session"
     )
 
-    # ARIA accuracy scorecard section
+    # NexTrade accuracy scorecard section
     sc = scorecard or {}
     if sc.get("total_evaluated", 0) > 0:
         scorecard_section = (
             "\n━━━━━━━━━━━━━━━━━━\n"
-            "📈 <b>ARIA SCORECARD</b> (last 7 days)\n"
+            "📈 <b>NexTrade Scorecard</b> (last 7 days)\n"
             f"Win rate: <b>{sc['win_rate']:.0f}%</b> | "
             f"{sc['wins']}W {sc['losses']}L {sc['neutrals']}N\n"
             f"Avg P&amp;L: <b>{sc['avg_pnl_pct']:+.1f}%</b> per signal\n"
         )
         if sc.get("top_wins"):
-            scorecard_section += "\n✅ Top wins:\n"
+            scorecard_section += "\nTop wins:\n"
             for w in sc["top_wins"][:2]:
-                scorecard_section += f"• {w['symbol']}: {w['pnl_pct']:+.1f}%\n"
+                scorecard_section += f"- {w['symbol']}: {w['pnl_pct']:+.1f}%\n"
         if sc.get("top_losses"):
-            scorecard_section += "\n❌ Recent losses:\n"
+            scorecard_section += "\nRecent losses:\n"
             for l in sc["top_losses"][:2]:
-                scorecard_section += f"• {l['symbol']}: {l['pnl_pct']:+.1f}%\n"
+                scorecard_section += f"- {l['symbol']}: {l['pnl_pct']:+.1f}%\n"
     else:
         scorecard_section = (
             "\n━━━━━━━━━━━━━━━━━━\n"
-            "📈 <b>ARIA SCORECARD</b>\n"
+            "📈 <b>NexTrade Scorecard</b>\n"
             "Building accuracy baseline — first week of live signals.\n"
         )
 
     score = (
         f"{scorecard_section}"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>SCORECARD</b>\n"
-        f"BUY signals: {buy_count}\n"
-        f"WATCH signals: {watch_count}\n"
-        f"EXIT signals: {exit_count}\n"
+        "📊 <b>Signals today</b>\n"
+        f"Buy: {buy_count} | Watch: {watch_count} | Exit: {exit_count}\n"
         f"Stocks analysed: {total_a}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Powered by ARIA</i>"
+        "<i>Powered by NexTrade</i>"
     )
     return f"{header}\n\n{body}{score}"
 
@@ -1033,6 +1122,7 @@ def generate_pulse(trader_id: int) -> dict:
             analysis, portfolio, watchlist, trader_id, target_date,
             scorecard=scorecard, accuracy_context=accuracy_context,
             trader_context=trader_context,
+            preferences=preferences, stock_intents=stock_intents,
         )
         deepseek_input = {"system": system_msg, "user": user_msg}
 
@@ -1099,14 +1189,6 @@ def generate_pulse(trader_id: int) -> dict:
     finally:
         conn.close()
 
-
-PREMARKET_SYSTEM_PROMPT = """You are ARIA, a DSE trading intelligence assistant.
-Generate a sharp pre-market briefing for the trader.
-Market opens in 5 minutes.
-Be specific, actionable, and concise.
-Maximum 400 words.
-Plain text only, no markdown, use CAPS for emphasis.
-Focus on: what to watch at open, key levels, risk reminders."""
 
 
 def generate_premarket_briefing(trader_id: int) -> dict:
@@ -1275,7 +1357,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             sym = p["symbol"]
             sup = support_by_sym.get(sym, [])
             sup_str = str(sup[0]) if sup else "N/A"
-            at_sl = " — AT STOP-LOSS THRESHOLD — REVIEW AT OPEN" if (p.get("pnl_pct") or 0) <= -8 else ""
+            at_sl = " — at stop-loss threshold; review at open" if (p.get("pnl_pct") or 0) <= -8 else ""
             lines.append(
                 f"- {sym}: {p['quantity']} shares @ avg {p['avg_buy_price']}\n"
                 f"  Current: {p['current_price']} | P&L: {p.get('pnl_pct', 0):+.1f}%\n"
@@ -1290,17 +1372,40 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             )
 
         user_msg = "\n".join(lines)
-        deepseek_input = {"system": PREMARKET_SYSTEM_PROMPT, "user": user_msg}
+
+        preferences: dict = {}
+        stock_intents: list = []
+        trader_ctx = ""
+        try:
+            preferences = get_trader_preferences(conn, trader_id)
+            stock_intents = get_trader_stock_intents(conn, trader_id)
+            trader_ctx = build_trader_context(preferences, stock_intents)
+        except Exception as pref_err:
+            logger.warning("Premarket preferences fetch error (non-fatal): %s", pref_err)
+
+        base_system = build_system_prompt(preferences or {})
+        premarket_addon = (
+            "PREMARKET BRIEFING MODE:\n"
+            "- Market opens in 5 minutes; be specific and actionable.\n"
+            "- Plain text in the body; sentence case throughout; max 400 words.\n"
+            "- Focus on: what to watch at open, key levels, risk reminders.\n"
+        )
+        system_msg = base_system
+        if trader_ctx.strip():
+            system_msg += "\n\n" + trader_ctx.strip() + "\n"
+        system_msg += "\n\n" + premarket_addon
+
+        deepseek_input = {"system": system_msg, "user": user_msg}
 
         try:
-            deepseek_output = call_deepseek(PREMARKET_SYSTEM_PROMPT, user_msg, temperature=0.2)
+            deepseek_output = call_deepseek(system_msg, user_msg, temperature=0.2)
         except Exception as e:
             deepseek_output = f"DeepSeek API error: {e}"
 
         # --- Format Telegram message ---
         body = html.escape(deepseek_output, quote=True)
         telegram_message = (
-            f"🌅 <b>ARIA Pre-Market Briefing</b>\n"
+            f"🌅 <b>NexTrade Pre-Market Briefing</b>\n"
             f"📅 {html.escape(target_date.isoformat())} | Market opens in 5 minutes\n\n"
             f"{body}\n\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -1308,7 +1413,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             f"👁 Watchlist: {len(watchlist)} | "
             f"📊 Yesterday BUY signals: {len(buy_signals)}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Powered by ARIA</i>"
+            f"<i>Powered by NexTrade</i>"
         )
 
         try:
