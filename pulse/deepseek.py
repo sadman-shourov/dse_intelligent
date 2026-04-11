@@ -432,6 +432,125 @@ def _enrich_position_row(cur, symbol: str, quantity: int, avg_buy_price: float) 
     }
 
 
+def get_trader_preferences(conn, trader_id: int) -> dict:
+    """Fetch trader preferences by joining traders + trader_preferences."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT
+                t.name,
+                t.trading_style,
+                t.holding_period,
+                t.risk_tolerance,
+                t.strategy_notes,
+                t.onboarding_complete,
+                tp.preferred_signals,
+                tp.avoid_signals,
+                tp.notes AS detailed_notes
+            FROM traders t
+            LEFT JOIN trader_preferences tp ON t.id = tp.trader_id
+            WHERE t.id = %s
+            """,
+            (trader_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+
+    if not row:
+        return {}
+    return {
+        "name": row[0] or f"Trader {trader_id}",
+        "trading_style": row[1] or "not specified",
+        "holding_period": row[2] or "not specified",
+        "risk_tolerance": row[3] or "moderate",
+        "strategy_notes": row[4] or "",
+        "onboarding_complete": bool(row[5]),
+        "preferred_signals": row[6] or "",
+        "avoid_signals": row[7] or "",
+        "detailed_notes": row[8] or "",
+    }
+
+
+def get_trader_stock_intents(conn, trader_id: int) -> list:
+    """Fetch all active stock intents with latest price."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT
+                tsi.symbol,
+                tsi.avg_buy_price,
+                tsi.intent,
+                tsi.target_price,
+                tsi.stop_price,
+                tsi.timeframe,
+                tsi.notes,
+                ph.ltp AS current_price
+            FROM trader_stock_intents tsi
+            LEFT JOIN (
+                SELECT DISTINCT ON (symbol) symbol, ltp
+                FROM price_history
+                ORDER BY symbol, date DESC
+            ) ph ON tsi.symbol = ph.symbol
+            WHERE tsi.trader_id = %s AND tsi.is_active = TRUE
+            ORDER BY tsi.updated_at DESC
+            """,
+            (trader_id,),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    intents = []
+    for r in rows:
+        avg = float(r[1]) if r[1] else 0.0
+        current = float(r[7]) if r[7] else 0.0
+        pnl = round(((current - avg) / avg * 100), 2) if avg > 0 else 0.0
+        intents.append({
+            "symbol": r[0],
+            "avg_buy_price": avg,
+            "intent": r[2],
+            "target_price": float(r[3]) if r[3] else None,
+            "stop_price": float(r[4]) if r[4] else None,
+            "timeframe": r[5] or "",
+            "notes": r[6] or "",
+            "current_price": current,
+            "pnl_pct": pnl,
+        })
+    return intents
+
+
+def build_trader_context(preferences: dict, stock_intents: list) -> str:
+    """Build personalised trader context string for injection into DeepSeek prompt."""
+    if not preferences:
+        return ""
+
+    context = (
+        f"TRADER PROFILE:\n"
+        f"Name: {preferences.get('name', 'Trader')}\n"
+        f"Style: {preferences.get('trading_style', 'not specified')}\n"
+        f"Holding period: {preferences.get('holding_period', 'not specified')}\n"
+        f"Risk tolerance: {preferences.get('risk_tolerance', 'moderate')}\n"
+        f"Strategy: {preferences.get('strategy_notes', 'none provided')}\n"
+    )
+
+    if stock_intents:
+        context += "\nSTOCK-SPECIFIC INTENTS:\n"
+        for s in stock_intents:
+            pnl_str = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "N/A"
+            context += (
+                f"- {s['symbol']}: avg {s['avg_buy_price']} | "
+                f"now {s['current_price']} ({pnl_str}) | "
+                f"intent: {s['intent']} | "
+                f"target: {s['target_price']} | "
+                f"timeframe: {s['timeframe']}\n"
+            )
+
+    return context
+
+
 def get_trader_portfolio(conn, trader_id: int) -> list[dict]:
     cur = conn.cursor()
     try:
@@ -583,7 +702,25 @@ def build_pulse_prompt(
     target_date: date,
     scorecard: dict | None = None,
     accuracy_context: str = "",
+    trader_context: str = "",
 ) -> tuple[str, str]:
+    # Build personalised system message
+    personalisation = ""
+    if trader_context:
+        personalisation = f"""
+
+{trader_context}
+
+PERSONALISATION RULES:
+- If trading_style is "position": focus on multi-week setups, mention resistance-based exits, wider context, do not suggest quick flips
+- If trading_style is "swing": focus on 5-15 day momentum, clear entry/exit levels
+- If trading_style is "intraday": focus on today's volume spikes, breakouts, tight stops
+- If risk_tolerance is "conservative": always lead with downside risk before upside potential
+- If risk_tolerance is "aggressive": can highlight higher risk/reward opportunities
+- For each stock in STOCK-SPECIFIC INTENTS: align advice with stated intent and timeframe; do not contradict their stated plan unless there is a strong structural reason"""
+
+    effective_system = SYSTEM_PROMPT + personalisation
+
     mc = analysis.get("market_context") or {}
     dsex = mc.get("dsex_index")
     vol = mc.get("total_volume")
@@ -694,7 +831,7 @@ def build_pulse_prompt(
         lines.append("")
         lines.append(accuracy_context)
 
-    return SYSTEM_PROMPT, "\n".join(lines)
+    return effective_system, "\n".join(lines)
 
 
 def call_deepseek(system_message: str, user_message: str, temperature: float = 0.3) -> str:
@@ -866,6 +1003,17 @@ def generate_pulse(trader_id: int) -> dict:
         portfolio = get_trader_portfolio(conn, trader_id)
         watchlist = get_trader_watchlist(conn, trader_id)
 
+        # Trader personalisation
+        preferences: dict = {}
+        stock_intents: list = []
+        trader_context: str = ""
+        try:
+            preferences = get_trader_preferences(conn, trader_id)
+            stock_intents = get_trader_stock_intents(conn, trader_id)
+            trader_context = build_trader_context(preferences, stock_intents)
+        except Exception as pref_err:
+            logger.warning("Preferences fetch error (non-fatal): %s", pref_err)
+
         # Run signal evaluation and fetch scorecard / accuracy context
         scorecard: dict = {}
         accuracy_context: str = ""
@@ -884,6 +1032,7 @@ def generate_pulse(trader_id: int) -> dict:
         system_msg, user_msg = build_pulse_prompt(
             analysis, portfolio, watchlist, trader_id, target_date,
             scorecard=scorecard, accuracy_context=accuracy_context,
+            trader_context=trader_context,
         )
         deepseek_input = {"system": system_msg, "user": user_msg}
 

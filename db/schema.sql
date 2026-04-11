@@ -286,3 +286,39 @@ CREATE TABLE IF NOT EXISTS accuracy_scores (
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(period_start, period_end, signal_type)
 );
+
+-- Trader onboarding fields (traders table has no updated_at)
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN DEFAULT FALSE;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS trading_style VARCHAR(50);
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS risk_tolerance VARCHAR(20);
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS strategy_notes TEXT;
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS holding_period VARCHAR(50);
+
+CREATE TABLE IF NOT EXISTS trader_preferences (
+    trader_id        BIGINT PRIMARY KEY REFERENCES traders(id),
+    trading_style    VARCHAR(50),
+    holding_period   VARCHAR(50),
+    risk_tolerance   VARCHAR(20),
+    preferred_signals TEXT,
+    avoid_signals    TEXT,
+    notes            TEXT,
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS trader_stock_intents (
+    id               BIGSERIAL PRIMARY KEY,
+    trader_id        BIGINT NOT NULL REFERENCES traders(id),
+    symbol           VARCHAR(20),
+    avg_buy_price    NUMERIC(10,2),
+    intent           VARCHAR(20) CHECK (intent IN ('HOLD','EXIT','WATCH','AVERAGE')),
+    target_price     NUMERIC(10,2),
+    stop_price       NUMERIC(10,2),
+    timeframe        VARCHAR(50),
+    notes            TEXT,
+    is_active        BOOLEAN DEFAULT TRUE,
+    updated_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(trader_id, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_intents_trader
+    ON trader_stock_intents(trader_id);

@@ -10,7 +10,7 @@ from typing import Any
 
 import psycopg2
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import JSONResponse
 
 from ingestion.sync_stocks_master import sync_stocks_master
@@ -148,6 +148,15 @@ def root():
             {"path": "/watchlist/{trader_id}", "method": "GET", "description": "Trader's watchlist with current signals"},
             {"path": "/watchlist/{trader_id}/add", "method": "POST", "description": "Add a stock to watchlist"},
             {"path": "/watchlist/{trader_id}/remove", "method": "POST", "description": "Remove a stock from watchlist"},
+            # Trader onboarding & preferences
+            {"path": "/trader/register", "method": "POST", "description": "Register a new trader from Telegram"},
+            {"path": "/trader/{trader_id}/onboarding", "method": "POST", "description": "Save onboarding data and mark complete"},
+            {"path": "/trader/{trader_id}/preferences", "method": "GET", "description": "Get trader preferences"},
+            {"path": "/trader/{trader_id}/preferences", "method": "POST", "description": "Update trader preferences"},
+            {"path": "/trader/{trader_id}/stock-intent", "method": "POST", "description": "Save or update a stock-specific intent"},
+            {"path": "/trader/{trader_id}/stock-intents", "method": "GET", "description": "Get all active stock intents"},
+            {"path": "/trader/{trader_id}/stock-intent/{symbol}", "method": "DELETE", "description": "Deactivate a stock intent"},
+            {"path": "/trader/by-telegram/{telegram_chat_id}", "method": "GET", "description": "Look up trader by Telegram chat ID"},
         ]
     }
 
@@ -1225,6 +1234,365 @@ def get_watchlist(trader_id: int):
             conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Trader onboarding & preferences endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/trader/register")
+async def register_trader(request: Request):
+    conn = None
+    try:
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        telegram_id = str(body.get("telegram_id") or "").strip()
+        if not telegram_id:
+            return JSONResponse(status_code=400, content={"error": "telegram_id is required"})
+
+        conn = _get_conn()
+        cur = conn.cursor()
+
+        # Check if already exists
+        cur.execute(
+            "SELECT id, name, onboarding_complete FROM traders WHERE telegram_chat_id = %s LIMIT 1",
+            (telegram_id,),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.close()
+            return _jsonify({
+                "status": "existing",
+                "trader": {"trader_id": int(row[0]), "name": row[1] or "", "onboarding_complete": bool(row[2])},
+            })
+
+        cur.execute(
+            """
+            INSERT INTO traders (name, telegram_chat_id, is_active, onboarding_complete)
+            VALUES (%s, %s, TRUE, FALSE)
+            RETURNING id
+            """,
+            (name, telegram_id),
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return _jsonify({
+            "status": "created",
+            "trader": {"trader_id": int(new_id), "name": name, "onboarding_complete": False},
+        })
+    except Exception as e:
+        logger.exception("register_trader error")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/trader/{trader_id}/onboarding")
+async def complete_onboarding(trader_id: int, request: Request):
+    conn = None
+    try:
+        body = await request.json()
+        trading_style = body.get("trading_style", "")
+        holding_period = body.get("holding_period", "")
+        risk_tolerance = body.get("risk_tolerance", "")
+        strategy_notes = body.get("strategy_notes", "")
+
+        conn = _get_conn()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            UPDATE traders
+            SET trading_style = %s, holding_period = %s, risk_tolerance = %s,
+                strategy_notes = %s, onboarding_complete = TRUE
+            WHERE id = %s
+            """,
+            (trading_style, holding_period, risk_tolerance, strategy_notes, trader_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO trader_preferences (trader_id, trading_style, holding_period, risk_tolerance, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (trader_id) DO UPDATE SET
+                trading_style = EXCLUDED.trading_style,
+                holding_period = EXCLUDED.holding_period,
+                risk_tolerance = EXCLUDED.risk_tolerance,
+                updated_at = NOW()
+            """,
+            (trader_id, trading_style, holding_period, risk_tolerance),
+        )
+        conn.commit()
+
+        cur.execute(
+            "SELECT id, name, trading_style, holding_period, risk_tolerance, strategy_notes, onboarding_complete FROM traders WHERE id = %s",
+            (trader_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+        return _jsonify({
+            "status": "ok",
+            "trader_id": int(row[0]),
+            "name": row[1] or "",
+            "trading_style": row[2] or "",
+            "holding_period": row[3] or "",
+            "risk_tolerance": row[4] or "",
+            "strategy_notes": row[5] or "",
+            "onboarding_complete": bool(row[6]),
+        })
+    except Exception as e:
+        logger.exception("complete_onboarding trader_id=%s", trader_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/trader/{trader_id}/preferences")
+async def update_preferences(trader_id: int, request: Request):
+    conn = None
+    try:
+        body = await request.json()
+        trading_style = body.get("trading_style", "")
+        holding_period = body.get("holding_period", "")
+        risk_tolerance = body.get("risk_tolerance", "")
+        strategy_notes = body.get("strategy_notes", "")
+        preferred_signals = body.get("preferred_signals", "")
+        avoid_signals = body.get("avoid_signals", "")
+        notes = body.get("notes", "")
+
+        conn = _get_conn()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            UPDATE traders
+            SET trading_style = %s, holding_period = %s, risk_tolerance = %s,
+                strategy_notes = %s
+            WHERE id = %s
+            """,
+            (trading_style, holding_period, risk_tolerance, strategy_notes, trader_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO trader_preferences
+                (trader_id, trading_style, holding_period, risk_tolerance,
+                 preferred_signals, avoid_signals, notes, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (trader_id) DO UPDATE SET
+                trading_style = EXCLUDED.trading_style,
+                holding_period = EXCLUDED.holding_period,
+                risk_tolerance = EXCLUDED.risk_tolerance,
+                preferred_signals = EXCLUDED.preferred_signals,
+                avoid_signals = EXCLUDED.avoid_signals,
+                notes = EXCLUDED.notes,
+                updated_at = NOW()
+            """,
+            (trader_id, trading_style, holding_period, risk_tolerance,
+             preferred_signals, avoid_signals, notes),
+        )
+        conn.commit()
+        cur.close()
+        return _jsonify({
+            "status": "ok",
+            "trader_id": trader_id,
+            "trading_style": trading_style,
+            "holding_period": holding_period,
+            "risk_tolerance": risk_tolerance,
+            "strategy_notes": strategy_notes,
+            "preferred_signals": preferred_signals,
+            "avoid_signals": avoid_signals,
+        })
+    except Exception as e:
+        logger.exception("update_preferences trader_id=%s", trader_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/trader/{trader_id}/preferences")
+def get_preferences(trader_id: int):
+    conn = None
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT t.id, t.name, t.trading_style, t.holding_period,
+                   t.risk_tolerance, t.strategy_notes, t.onboarding_complete,
+                   tp.preferred_signals, tp.avoid_signals, tp.notes
+            FROM traders t
+            LEFT JOIN trader_preferences tp ON t.id = tp.trader_id
+            WHERE t.id = %s
+            """,
+            (trader_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+        return _jsonify({
+            "trader_id": int(row[0]),
+            "name": row[1] or "",
+            "trading_style": row[2] or "",
+            "holding_period": row[3] or "",
+            "risk_tolerance": row[4] or "",
+            "strategy_notes": row[5] or "",
+            "onboarding_complete": bool(row[6]),
+            "preferred_signals": row[7] or "",
+            "avoid_signals": row[8] or "",
+            "notes": row[9] or "",
+        })
+    except Exception as e:
+        logger.exception("get_preferences trader_id=%s", trader_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/trader/{trader_id}/stock-intent")
+async def save_stock_intent(trader_id: int, request: Request):
+    conn = None
+    try:
+        body = await request.json()
+        symbol = (body.get("symbol") or "").upper().strip()
+        if not symbol:
+            return JSONResponse(status_code=400, content={"error": "symbol is required"})
+        avg_buy_price = _float(body.get("avg_buy_price"))
+        intent = (body.get("intent") or "HOLD").upper()
+        target_price = _float(body.get("target_price"))
+        stop_price = _float(body.get("stop_price"))
+        timeframe = body.get("timeframe", "")
+        notes = body.get("notes", "")
+
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trader_stock_intents
+                (trader_id, symbol, avg_buy_price, intent, target_price,
+                 stop_price, timeframe, notes, is_active, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW())
+            ON CONFLICT (trader_id, symbol) DO UPDATE SET
+                avg_buy_price = EXCLUDED.avg_buy_price,
+                intent = EXCLUDED.intent,
+                target_price = EXCLUDED.target_price,
+                stop_price = EXCLUDED.stop_price,
+                timeframe = EXCLUDED.timeframe,
+                notes = EXCLUDED.notes,
+                is_active = TRUE,
+                updated_at = NOW()
+            """,
+            (trader_id, symbol, avg_buy_price, intent, target_price,
+             stop_price, timeframe, notes),
+        )
+        conn.commit()
+        cur.close()
+        return _jsonify({
+            "status": "ok",
+            "trader_id": trader_id,
+            "symbol": symbol,
+            "avg_buy_price": avg_buy_price,
+            "intent": intent,
+            "target_price": target_price,
+            "stop_price": stop_price,
+            "timeframe": timeframe,
+            "notes": notes,
+        })
+    except Exception as e:
+        logger.exception("save_stock_intent trader_id=%s symbol=%s", trader_id, symbol if 'symbol' in dir() else '?')
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/trader/{trader_id}/stock-intents")
+def get_stock_intents(trader_id: int):
+    conn = None
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                tsi.symbol, tsi.avg_buy_price, tsi.intent,
+                tsi.target_price, tsi.stop_price, tsi.timeframe,
+                tsi.notes, tsi.updated_at,
+                ph.ltp AS current_price,
+                ar.overall_signal, ar.confidence_score
+            FROM trader_stock_intents tsi
+            LEFT JOIN (
+                SELECT DISTINCT ON (symbol) symbol, ltp
+                FROM price_history
+                ORDER BY symbol, date DESC
+            ) ph ON tsi.symbol = ph.symbol
+            LEFT JOIN (
+                SELECT DISTINCT ON (symbol) symbol, overall_signal, confidence_score
+                FROM analysis_results
+                ORDER BY symbol, analysis_date DESC, session_no DESC NULLS LAST, id DESC
+            ) ar ON tsi.symbol = ar.symbol
+            WHERE tsi.trader_id = %s AND tsi.is_active = TRUE
+            ORDER BY tsi.updated_at DESC
+            """,
+            (trader_id,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+        intents = []
+        for r in rows:
+            avg = _float(r[1]) or 0.0
+            current = _float(r[8]) or 0.0
+            pnl = round(((current - avg) / avg * 100), 2) if avg > 0 else 0.0
+            intents.append({
+                "symbol": r[0],
+                "avg_buy_price": avg,
+                "intent": r[2],
+                "target_price": _float(r[3]),
+                "stop_price": _float(r[4]),
+                "timeframe": r[5] or "",
+                "notes": r[6] or "",
+                "updated_at": r[7].isoformat() if hasattr(r[7], "isoformat") else str(r[7]),
+                "current_price": current,
+                "pnl_pct": pnl,
+                "current_signal": r[9] or "",
+                "confidence": _float(r[10]),
+            })
+        return _jsonify({"trader_id": trader_id, "intents": intents})
+    except Exception as e:
+        logger.exception("get_stock_intents trader_id=%s", trader_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.delete("/trader/{trader_id}/stock-intent/{symbol}")
+def delete_stock_intent(trader_id: int, symbol: str):
+    conn = None
+    try:
+        symbol = symbol.upper().strip()
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE trader_stock_intents SET is_active = FALSE WHERE trader_id = %s AND symbol = %s",
+            (trader_id, symbol),
+        )
+        conn.commit()
+        cur.close()
+        return _jsonify({"status": "ok", "trader_id": trader_id, "symbol": symbol, "is_active": False})
+    except Exception as e:
+        logger.exception("delete_stock_intent trader_id=%s symbol=%s", trader_id, symbol)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.get("/trader/by-telegram/{telegram_chat_id}")
 def get_trader_by_telegram(telegram_chat_id: str):
     conn = None
@@ -1246,33 +1614,20 @@ def get_trader_by_telegram(telegram_chat_id: str):
                 content={"error": "traders.telegram_chat_id column is not available"},
             )
         chat = telegram_chat_id.strip()
-        if "name" in tcols:
-            cur.execute(
-                "SELECT id, name FROM traders WHERE telegram_chat_id = %s LIMIT 1",
-                (chat,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return JSONResponse(status_code=404, content={"error": "Trader not found"})
-            tid, name = row
-            return {
-                "trader_id": int(tid),
-                "name": (name or "").strip() or f"Trader {tid}",
-                "telegram_chat_id": chat,
-            }
-        cur.execute(
-            "SELECT id FROM traders WHERE telegram_chat_id = %s LIMIT 1",
-            (chat,),
-        )
+        extra_cols = {"onboarding_complete", "trading_style", "risk_tolerance"} & tcols
+        select_extra = ", ".join(sorted(extra_cols)) if extra_cols else ""
+        select_sql = f"SELECT id, name{', ' + select_extra if select_extra else ''} FROM traders WHERE telegram_chat_id = %s LIMIT 1"
+        cur.execute(select_sql, (chat,))
         row = cur.fetchone()
         if not row:
             return JSONResponse(status_code=404, content={"error": "Trader not found"})
-        tid = row[0]
-        return {
-            "trader_id": int(tid),
-            "name": f"Trader {tid}",
-            "telegram_chat_id": chat,
-        }
+        tid = int(row[0])
+        name = (row[1] or "").strip() or f"Trader {tid}"
+        result: dict = {"trader_id": tid, "name": name, "telegram_chat_id": chat}
+        col_names = ["id", "name"] + sorted(extra_cols)
+        for i, col in enumerate(col_names[2:], start=2):
+            result[col] = row[i] if i < len(row) else None
+        return _jsonify(result)
     except Exception as e:
         logger.exception("get_trader_by_telegram chat_id=%s", telegram_chat_id)
         return JSONResponse(status_code=500, content={"error": str(e)})
