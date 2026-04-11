@@ -627,6 +627,17 @@ def get_stock(symbol: str):
             class_flags = cf if isinstance(cf, dict) else {}
             analysis_date = ar[12].strftime("%d %b %Y") if hasattr(ar[12], "strftime") else str(ar[12]) if ar[12] else None
 
+        cur.execute(
+            "SELECT MAX(date) FROM price_history WHERE symbol = %s",
+            (symbol,),
+        )
+        latest_price_date = cur.fetchone()[0]
+        data_as_of = (
+            latest_price_date.strftime("%d %b %Y")
+            if latest_price_date
+            else analysis_date
+        )
+
         reason = sig[1] if sig else None
 
         return {
@@ -647,6 +658,7 @@ def get_stock(symbol: str):
             "rsi": rsi,
             "breakout": breakout,
             "analysis_date": analysis_date,
+            "data_as_of": data_as_of,
             "class_flags": class_flags,
         }
     except Exception as e:
