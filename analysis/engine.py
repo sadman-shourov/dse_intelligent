@@ -474,6 +474,80 @@ def bulk_fetch_market_context(target_date: date) -> dict:
     return ctx
 
 
+def detect_market_trend(conn) -> dict:
+    """Fetch last 5 trading days of market_summary to detect uptrend / downtrend."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT trade_date, dsex_index
+            FROM market_summary
+            WHERE trade_date <= CURRENT_DATE
+            ORDER BY trade_date DESC
+            LIMIT 5
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    empty = {"trend": "unknown", "consecutive_down_days": 0, "consecutive_up_days": 0, "dsex_5d_change_pct": None}
+    if len(rows) < 2:
+        return empty
+
+    # Filter out None dsex values
+    rows = [(r[0], float(r[1])) for r in rows if r[1] is not None]
+    if len(rows) < 2:
+        return empty
+
+    consecutive_down = 0
+    for i in range(len(rows) - 1):
+        if rows[i][1] < rows[i + 1][1]:
+            if consecutive_down == 0 or i == consecutive_down:
+                consecutive_down += 1
+        else:
+            break
+
+    consecutive_up = 0
+    for i in range(len(rows) - 1):
+        if rows[i][1] > rows[i + 1][1]:
+            if consecutive_up == 0 or i == consecutive_up:
+                consecutive_up += 1
+        else:
+            break
+
+    latest_dsex = rows[0][1]
+    oldest_dsex = rows[-1][1]
+    dsex_5d_change = ((latest_dsex - oldest_dsex) / oldest_dsex * 100) if oldest_dsex else 0
+
+    if consecutive_down >= 3:
+        trend = "downtrend"
+    elif consecutive_up >= 3:
+        trend = "uptrend"
+    elif dsex_5d_change < -2:
+        trend = "weak"
+    elif dsex_5d_change > 2:
+        trend = "strong"
+    else:
+        trend = "neutral"
+
+    return {
+        "trend": trend,
+        "consecutive_down_days": consecutive_down,
+        "consecutive_up_days": consecutive_up,
+        "dsex_5d_change_pct": round(dsex_5d_change, 2),
+    }
+
+
+def bulk_fetch_market_trend() -> dict:
+    """Called once in analyse_all_symbols() and passed to all symbols."""
+    conn = get_db_connection()
+    try:
+        return detect_market_trend(conn)
+    finally:
+        conn.close()
+
+
 def _current_price(df: pd.DataFrame) -> float | None:
     if df.empty:
         return None
@@ -1009,6 +1083,7 @@ def determine_overall_signal(
     intraday: dict | None = None,
     rs: dict | None = None,
     market_context: dict | None = None,
+    market_trend: dict | None = None,
 ) -> tuple[str, float]:
     score = 50
 
@@ -1069,7 +1144,7 @@ def determine_overall_signal(
         elif rs_sig == "underperform":
             score -= 5
 
-    # DSEX direction (from market_context if available, else fall back to summary pair)
+    # DSEX daily direction (from market_context if available, else fall back to summary pair)
     dsex_chg = None
     if market_context and market_context.get("dsex_change_pct") is not None:
         dsex_chg = market_context["dsex_change_pct"]
@@ -1082,11 +1157,36 @@ def determine_overall_signal(
         except Exception:
             pass
 
-    if dsex_chg is not None:
-        if dsex_chg > 1.0:
-            score += 5
-        elif dsex_chg < -1.0:
-            score -= 5
+    dsex_chg = dsex_chg or 0
+    if dsex_chg > 2:
+        score += 8    # strong up day
+    elif dsex_chg > 1:
+        score += 4    # mild up day
+    elif dsex_chg < -2:
+        score -= 15   # strong down day — very cautious
+    elif dsex_chg < -1:
+        score -= 10   # mild down day — cautious
+
+    # Multi-day market trend scoring
+    mt = market_trend or {}
+    trend = mt.get("trend", "unknown")
+    consecutive_down = mt.get("consecutive_down_days", 0)
+    dsex_5d = mt.get("dsex_5d_change_pct", 0) or 0
+
+    if trend == "downtrend":
+        score -= 20   # 3+ consecutive down days
+        score = min(score, 64)   # never generate BUY in downtrend
+    elif trend == "weak":
+        score -= 12   # 5-day decline > 2%
+    elif trend == "uptrend":
+        score += 10   # 3+ consecutive up days
+    elif trend == "strong":
+        score += 6    # 5-day gain > 2%
+
+    if consecutive_down == 2:
+        score -= 8
+    elif consecutive_down >= 3:
+        score -= 20   # already captured in downtrend but stack it
 
     flags = class_flags or {}
     if flags.get("mutual_fund"):
@@ -1213,6 +1313,7 @@ def analyse_symbol(
     target_date: date | None = None,
     live_ticks_today: list[dict] | None = None,  # full session list (CHANGE 2/3)
     market_context: dict | None = None,           # pre-computed context with dsex_change_pct
+    market_trend: dict | None = None,             # multi-day trend from bulk_fetch_market_trend
 ) -> dict:
     try:
         df = price_df.copy() if price_df is not None else get_price_history(symbol, days=90)
@@ -1321,6 +1422,7 @@ def analyse_symbol(
             intraday=intraday,
             rs=rs,
             market_context=market_context,
+            market_trend=market_trend,
         )
 
         analysis_date = target_date.isoformat()
@@ -1364,6 +1466,7 @@ def analyse_symbol(
                 "relative_strength": rs,
                 "volume_profile": volume,
                 "signal_reason": reason,
+                "market_trend": market_trend or {},
             },
             "signal_reason": reason,
             "price_at_signal": current_price,
@@ -1385,6 +1488,7 @@ def analyse_symbol_with_data(
     prev_market: dict | None,
     target_date: date,
     market_context: dict | None = None,
+    market_trend: dict | None = None,
 ) -> dict:
     live_ticks_today = live_ticks_map.get(symbol, [])
     return analyse_symbol(
@@ -1398,6 +1502,7 @@ def analyse_symbol_with_data(
         target_date=target_date,
         live_ticks_today=live_ticks_today,
         market_context=market_context,
+        market_trend=market_trend,
     )
 
 
@@ -1596,6 +1701,8 @@ def analyse_all_symbols() -> dict:
     metadata_map = bulk_fetch_stock_metadata()
     today_mkt, prev_mkt = bulk_fetch_market_summary()
     market_ctx = bulk_fetch_market_context(target_date)
+    market_trend = bulk_fetch_market_trend()
+    print(f"Market trend: {market_trend['trend']} | 5d change: {market_trend['dsex_5d_change_pct']}%")
 
     symbols = [s for s in symbols if s in price_history_map]
     print(f"Data loaded. Running analysis on {len(symbols)} symbols...")
@@ -1622,6 +1729,7 @@ def analyse_all_symbols() -> dict:
         prev_market=prev_mkt,
         target_date=target_date,
         market_context=market_ctx,
+        market_trend=market_trend,
     )
 
     processed = 0

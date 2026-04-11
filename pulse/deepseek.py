@@ -565,7 +565,14 @@ SELF-AWARENESS RULES:
 - If win rate > 65%: be more confident
 - Always mention recent win rate in pulse scorecard section
 - Never hide losses — acknowledge them directly
-- If a stock you previously called BUY is now down, address it directly"""
+- If a stock you previously called BUY is now down, address it directly
+
+MARKET REGIME RULES:
+- If market trend is DOWNTREND: open with warning, recommend capital preservation, no new BUY entries
+- If market trend is WEAK: be cautious, only highest confidence BUY signals worth mentioning
+- If market trend is UPTREND: be more confident, highlight momentum opportunities
+- If market trend is STRONG: lead with bullish tone, more aggressive targets
+- Always state market trend clearly at top of pulse"""
 
 
 def build_pulse_prompt(
@@ -592,11 +599,26 @@ def build_pulse_prompt(
     else:
         market_line = f"DSEX: {dsex} | Volume: {int(vol or 0):,} | Value: {tvm}mn"
 
+    # Market trend context
+    trend_data = analysis.get("market_trend") or {}
+    if trend_data and trend_data.get("trend", "unknown") != "unknown":
+        trend_line = (
+            f"MARKET TREND:\n"
+            f"Direction: {trend_data.get('trend', 'unknown').upper()}\n"
+            f"Consecutive down days: {trend_data.get('consecutive_down_days', 0)}\n"
+            f"5-day DSEX change: {trend_data.get('dsex_5d_change_pct', 0):+.1f}%"
+        )
+    else:
+        trend_line = ""
+
     lines: list[str] = []
     lines.append(f"DATE: {target_date.isoformat()}")
     lines.append("")
     lines.append("MARKET OVERVIEW:")
     lines.append(market_line)
+    if trend_line:
+        lines.append("")
+        lines.append(trend_line)
     lines.append("")
     lines.append(f"TOP BUY SIGNALS TODAY ({buy_total}):")
     for b in buys:
@@ -827,6 +849,12 @@ def generate_pulse(trader_id: int) -> dict:
         analysis = get_analysis_summary(conn, target_date)
         # Always use actual today for market context, regardless of analysis fallback date
         analysis["market_context"] = get_market_context(conn, actual_today)
+        # Fetch market trend for prompt injection
+        try:
+            from analysis.engine import detect_market_trend
+            analysis["market_trend"] = detect_market_trend(conn)
+        except Exception:
+            analysis["market_trend"] = {}
         if (analysis.get("total_analysed") or 0) == 0:
             skip = {"status": "skipped", "reason": "no analysis data for today"}
             try:
