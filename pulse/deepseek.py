@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import traceback
 from collections import defaultdict
@@ -695,7 +696,8 @@ CRITICAL FORMATTING RULES:
 - Sentence case throughout
 - Max 400 words
 - Always use actual price levels
-- HTML only for bold: <b>text</b>
+- Never use HTML or angle-bracket tags in your reply (no <b>, </b>, <i>, etc.)
+- Write stock symbols and emphasis as plain words only; the app formats the outer Telegram message
 
 """
 
@@ -946,6 +948,18 @@ def call_deepseek(system_message: str, user_message: str, temperature: float = 0
     return (response.choices[0].message.content or "").strip()
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain_text_for_telegram_body(model_text: str) -> str:
+    """Strip HTML-like tags the model may emit; body is then html-escaped for Telegram HTML mode."""
+    if not model_text:
+        return ""
+    t = _TAG_RE.sub("", model_text)
+    t = t.replace("&nbsp;", " ")
+    return t.strip()
+
+
 def format_telegram_message(
     deepseek_response: str,
     analysis: dict,
@@ -958,7 +972,7 @@ def format_telegram_message(
     exit_count = len(analysis.get("exit_signals") or [])
     total_a = analysis.get("total_analysed", 0)
 
-    body = html.escape(deepseek_response or "", quote=True)
+    body = html.escape(_plain_text_for_telegram_body(deepseek_response or ""), quote=True)
     header = (
         "🎯 <b>NexTrade Market Pulse</b>\n"
         f"📅 {html.escape(target_date.isoformat(), quote=True)} | DSE Trading Session"
@@ -1388,6 +1402,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             "PREMARKET BRIEFING MODE:\n"
             "- Market opens in 5 minutes; be specific and actionable.\n"
             "- Plain text in the body; sentence case throughout; max 400 words.\n"
+            "- No HTML tags in the body (no <b> or <i>); symbols in plain text only.\n"
             "- Focus on: what to watch at open, key levels, risk reminders.\n"
         )
         system_msg = base_system
@@ -1403,7 +1418,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             deepseek_output = f"DeepSeek API error: {e}"
 
         # --- Format Telegram message ---
-        body = html.escape(deepseek_output, quote=True)
+        body = html.escape(_plain_text_for_telegram_body(deepseek_output), quote=True)
         telegram_message = (
             f"🌅 <b>NexTrade Pre-Market Briefing</b>\n"
             f"📅 {html.escape(target_date.isoformat())} | Market opens in 5 minutes\n\n"
