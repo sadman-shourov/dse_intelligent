@@ -134,11 +134,11 @@ def root():
             {"path": "/stock/search/{query}", "method": "GET", "description": "Search DSE stock symbol by name"},
             {"path": "/alerts/extreme-moves", "method": "POST", "description": "Check and send extreme move alerts"},
             # Pulse
-            {"path": "/pulse/deliver/{trader_id}", "method": "POST", "description": "Deliver latest pulse to one trader via Telegram"},
             {"path": "/pulse/deliver/all", "method": "POST", "description": "Deliver latest pulse to all active traders via Telegram"},
+            {"path": "/pulse/deliver/{trader_id}", "method": "POST", "description": "Deliver latest pulse to one trader via Telegram"},
             {"path": "/pulse/generate/{trader_id}", "method": "POST", "description": "Generate DeepSeek market pulse + Telegram message for a trader"},
-            {"path": "/pulse/premarket/{trader_id}", "method": "POST", "description": "Generate and send pre-market briefing to one trader"},
             {"path": "/pulse/premarket/deliver/all", "method": "POST", "description": "Generate and send pre-market briefing to all active traders"},
+            {"path": "/pulse/premarket/{trader_id}", "method": "POST", "description": "Generate and send pre-market briefing to one trader"},
             # Chatbot
             {"path": "/stock/{symbol}", "method": "GET", "description": "Latest analysis for a single stock"},
             {"path": "/market/summary", "method": "GET", "description": "Today's market overview with signal counts"},
@@ -449,17 +449,6 @@ def signals_today():
 # Pulse endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/pulse/deliver/{trader_id}")
-def pulse_deliver_trader(trader_id: int):
-    try:
-        result = deliver_pulse(trader_id)
-        if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=_jsonify(result))
-        return JSONResponse(status_code=200, content=_jsonify(result))
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
-
-
 @app.post("/pulse/deliver/all")
 async def pulse_deliver_all(request: Request):
     try:
@@ -469,6 +458,17 @@ async def pulse_deliver_all(request: Request):
         return serialize_response(result)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/pulse/deliver/{trader_id}")
+def pulse_deliver_trader(trader_id: int):
+    try:
+        result = deliver_pulse(trader_id)
+        if result.get("status") == "error":
+            return JSONResponse(status_code=500, content=_jsonify(result))
+        return JSONResponse(status_code=200, content=_jsonify(result))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
 
 
 @app.post("/pulse/generate/{trader_id}")
