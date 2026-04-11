@@ -8,3 +8,6 @@ venv/
 *.log
 node_modules/
 .pytest_cache/
+
+# Local secrets — do not commit
+Documents/credentials.md
