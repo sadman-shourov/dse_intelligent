@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import traceback
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,17 @@ def _int(v: Any) -> int | None:
         return None
 
 
+def _serialize(obj: Any) -> str:
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _jsonify(data: Any) -> Any:
+    """Recursively coerce any date/datetime objects so JSONResponse never raises."""
+    return json.loads(json.dumps(data, default=_serialize))
+
+
 # ---------------------------------------------------------------------------
 # Existing job runner
 # ---------------------------------------------------------------------------
@@ -71,7 +83,7 @@ def _int(v: Any) -> int | None:
 def _run_job(fn):
     try:
         result = fn()
-        return JSONResponse(status_code=200, content=result)
+        return JSONResponse(status_code=200, content=_jsonify(result))
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -214,7 +226,7 @@ def ingest_live_ticks_endpoint():
         if conn:
             conn.close()
 
-    return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=200, content=_jsonify(result))
 
 
 @app.post("/ingest/cleanup-live-ticks")
@@ -319,7 +331,7 @@ def analyse_symbol_endpoint(symbol: str):
 def _run_step(fn):
     """Run a job function, return (result_dict, error_str)."""
     try:
-        return fn(), None
+        return _jsonify(fn()), None
     except Exception as e:
         return None, str(e)
 
@@ -338,7 +350,7 @@ def refresh_all():
     res, err = _run_step(analyse_all_symbols)
     results["analysis"] = res if res is not None else {"status": "error", "message": err}
 
-    return JSONResponse(status_code=200, content=results)
+    return JSONResponse(status_code=200, content=_jsonify(results))
 
 
 @app.post("/refresh/prices")
@@ -352,7 +364,7 @@ def refresh_prices():
     res, err = _run_step(analyse_all_symbols)
     results["analysis"] = res if res is not None else {"status": "error", "message": err}
 
-    return JSONResponse(status_code=200, content=results)
+    return JSONResponse(status_code=200, content=_jsonify(results))
 
 
 @app.post("/refresh/analysis")
@@ -363,7 +375,7 @@ def refresh_analysis():
     res, err = _run_step(analyse_all_symbols)
     results["analysis"] = res if res is not None else {"status": "error", "message": err}
 
-    return JSONResponse(status_code=200, content=results)
+    return JSONResponse(status_code=200, content=_jsonify(results))
 
 
 # ---------------------------------------------------------------------------
@@ -380,14 +392,14 @@ def evaluate_signals_endpoint():
 @app.get("/evaluate/scorecard")
 def get_scorecard_endpoint():
     result = get_recent_scorecard(days=7)
-    return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=200, content=_jsonify(result))
 
 
 @app.post("/evaluate/accuracy")
 def calculate_accuracy_endpoint():
     result = calculate_accuracy_scores(period_days=30)
     status_code = 200 if result.get("status") == "ok" else 500
-    return JSONResponse(status_code=status_code, content=result)
+    return JSONResponse(status_code=status_code, content=_jsonify(result))
 
 
 @app.get("/signals/today")
@@ -431,8 +443,8 @@ def pulse_deliver_trader(trader_id: int):
     try:
         result = deliver_pulse(trader_id)
         if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=result)
-        return JSONResponse(status_code=200, content=result)
+            return JSONResponse(status_code=500, content=_jsonify(result))
+        return JSONResponse(status_code=200, content=_jsonify(result))
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
 
@@ -442,8 +454,8 @@ def pulse_deliver_all():
     try:
         result = deliver_pulse()
         if result.get("status") == "error":
-            return JSONResponse(status_code=500, content=result)
-        return JSONResponse(status_code=200, content=result)
+            return JSONResponse(status_code=500, content=_jsonify(result))
+        return JSONResponse(status_code=200, content=_jsonify(result))
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
 
@@ -453,10 +465,10 @@ def pulse_endpoint(trader_id: int):
     try:
         result = generate_pulse(trader_id)
         if result.get("status") == "error" and result.get("reason") == "trader not found":
-            return JSONResponse(status_code=404, content=result)
+            return JSONResponse(status_code=404, content=_jsonify(result))
         if result.get("status") in ("skipped", "ok"):
-            return JSONResponse(status_code=200, content=result)
-        return JSONResponse(status_code=500, content=result)
+            return JSONResponse(status_code=200, content=_jsonify(result))
+        return JSONResponse(status_code=500, content=_jsonify(result))
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
 
@@ -465,7 +477,7 @@ def pulse_endpoint(trader_id: int):
 def premarket_deliver_all():
     try:
         result = deliver_premarket_briefing()
-        return JSONResponse(status_code=200, content=result)
+        return JSONResponse(status_code=200, content=_jsonify(result))
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
 
