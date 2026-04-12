@@ -147,7 +147,7 @@ def root():
             {"path": "/refresh/analysis", "method": "POST", "description": "Refresh analysis only"},
             {"path": "/stock/search/{query}", "method": "GET", "description": "Search DSE stock symbol by name"},
             {"path": "/alerts/extreme-moves", "method": "POST", "description": "Check and send extreme move alerts"},
-            {"path": "/alerts/pipeline-failure", "method": "POST", "description": "Notify all active traders of a data pipeline failure"},
+            {"path": "/alerts/pipeline-failure", "method": "POST", "description": "Send pipeline failure alert to all traders"},
             # Pulse
             {"path": "/pulse/deliver/all", "method": "POST", "description": "Deliver latest pulse to all active traders via Telegram"},
             {"path": "/pulse/deliver/{trader_id}", "method": "POST", "description": "Deliver latest pulse to one trader via Telegram"},
@@ -333,6 +333,10 @@ def extreme_moves_endpoint(threshold_pct: float = 5.0):
 @app.post("/alerts/pipeline-failure")
 def pipeline_failure_alert():
     """Send a failure alert to all active traders with Telegram chat IDs."""
+    from pulse.telegram import send_telegram_message
+    from datetime import datetime
+    import pytz
+
     conn = None
     try:
         conn = _get_conn()
@@ -355,20 +359,19 @@ def pipeline_failure_alert():
         traders = cur.fetchall()
         cur.close()
 
-        import pytz
-
         dhaka = pytz.timezone("Asia/Dhaka")
         now = datetime.now(dhaka).strftime("%d %b %H:%M")
 
         message = (
             f"⚠️ <b>NexTrade System Alert</b>\n\n"
-            f"Data pipeline issue detected at {now}.\n"
+            f"Data pipeline issue detected at {now} Dhaka time.\n"
             f"Market pulse may be delayed.\n"
-            f"Our team is looking into it."
+            f"We are looking into it."
         )
 
-        delivered = 0
-        for chat_id, name in traders:
+        alerted = 0
+        for row in traders:
+            chat_id, name = row
             try:
                 res = send_telegram_message(
                     chat_id=str(chat_id),
@@ -376,22 +379,13 @@ def pipeline_failure_alert():
                     parse_mode="HTML",
                 )
                 if res.get("status") == "ok":
-                    delivered += 1
-            except Exception:
-                logger.exception(
-                    "pipeline_failure_alert: send failed for trader %s",
-                    name or chat_id,
-                )
+                    alerted += 1
+            except Exception as e:
+                logger.warning("Failed to alert %s: %s", name or chat_id, e)
 
         return JSONResponse(
             status_code=200,
-            content=_jsonify(
-                {
-                    "status": "ok",
-                    "alerted": len(traders),
-                    "delivered": delivered,
-                }
-            ),
+            content=_jsonify({"status": "ok", "alerted": alerted}),
         )
     except Exception as e:
         logger.exception("pipeline_failure_alert error")
