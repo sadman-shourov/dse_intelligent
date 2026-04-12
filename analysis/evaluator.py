@@ -452,6 +452,20 @@ def get_recent_scorecard(days: int = 7) -> dict:
         wins_sorted = sorted(wins, key=lambda r: _float(r[5]) or 0.0, reverse=True)
         losses_sorted = sorted(losses, key=lambda r: _float(r[5]) or 0.0)
 
+        seen_symbols: set[str] = set()
+        unique_wins: list = []
+        for w in wins_sorted:
+            if w[0] not in seen_symbols:
+                seen_symbols.add(w[0])
+                unique_wins.append(w)
+
+        seen_symbols = set()
+        unique_losses: list = []
+        for w in losses_sorted:
+            if w[0] not in seen_symbols:
+                seen_symbols.add(w[0])
+                unique_losses.append(w)
+
         return {
             "period": f"last {days} days",
             "total_evaluated": total,
@@ -460,8 +474,8 @@ def get_recent_scorecard(days: int = 7) -> dict:
             "neutrals": len(neutrals),
             "win_rate": win_rate,
             "avg_pnl_pct": avg_pnl,
-            "top_wins": _fmt(wins_sorted),
-            "top_losses": _fmt(losses_sorted),
+            "top_wins": _fmt(unique_wins),
+            "top_losses": _fmt(unique_losses),
             "pending": pending,
             "accuracy_trend": trend,
         }
