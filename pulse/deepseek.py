@@ -396,7 +396,9 @@ def _enrich_position_row(cur, symbol: str, quantity: int, avg_buy_price: float) 
         signal = ar[0] or "HOLD"
         raw = _parse_json_dict(ar[1])
         sr = raw.get("sr") or {}
-        current_price = _float_or_none(sr.get("current_price"))
+        current_price = _float_or_none(raw.get("current_price"))
+        if current_price is None:
+            current_price = _float_or_none(sr.get("current_price"))
     cur.execute(
         """
         SELECT reason FROM signals
@@ -481,12 +483,12 @@ def get_trader_preferences(conn, trader_id: int) -> dict:
 
 
 def get_trader_stock_intents(conn, trader_id: int) -> list:
-    """Fetch all active stock intents with latest price."""
+    """Fetch active stock intents; price from today's analysis (live tick) with price_history fallback."""
     cur = conn.cursor()
     try:
         cur.execute(
             """
-            SELECT
+            SELECT DISTINCT ON (tsi.symbol)
                 tsi.symbol,
                 tsi.avg_buy_price,
                 tsi.intent,
@@ -494,15 +496,29 @@ def get_trader_stock_intents(conn, trader_id: int) -> list:
                 tsi.stop_price,
                 tsi.timeframe,
                 tsi.notes,
-                ph.ltp AS current_price
+                ar.overall_signal AS current_signal,
+                ar.confidence_score AS confidence,
+                COALESCE(
+                    NULLIF(trim(ar.raw_output->>'current_price'), '')::numeric,
+                    ph.ltp
+                ) AS current_price
             FROM trader_stock_intents tsi
             LEFT JOIN (
-                SELECT DISTINCT ON (symbol) symbol, ltp
+                SELECT DISTINCT ON (symbol)
+                    symbol, overall_signal, confidence_score, raw_output
+                FROM analysis_results
+                WHERE analysis_date = CURRENT_DATE
+                ORDER BY symbol, session_no DESC NULLS LAST, id DESC
+            ) ar ON tsi.symbol = ar.symbol
+            LEFT JOIN (
+                SELECT DISTINCT ON (symbol)
+                    symbol, ltp
                 FROM price_history
                 ORDER BY symbol, date DESC
             ) ph ON tsi.symbol = ph.symbol
-            WHERE tsi.trader_id = %s AND tsi.is_active = TRUE
-            ORDER BY tsi.updated_at DESC
+            WHERE tsi.trader_id = %s
+              AND tsi.is_active = TRUE
+            ORDER BY tsi.symbol, tsi.updated_at DESC
             """,
             (trader_id,),
         )
@@ -513,8 +529,9 @@ def get_trader_stock_intents(conn, trader_id: int) -> list:
     intents = []
     for r in rows:
         avg = float(r[1]) if r[1] else 0.0
-        current = float(r[7]) if r[7] else 0.0
+        current = float(r[9]) if r[9] is not None else 0.0
         pnl = round(((current - avg) / avg * 100), 2) if avg > 0 else 0.0
+        conf = r[8]
         intents.append({
             "symbol": r[0],
             "avg_buy_price": avg,
@@ -523,6 +540,8 @@ def get_trader_stock_intents(conn, trader_id: int) -> list:
             "stop_price": float(r[4]) if r[4] else None,
             "timeframe": r[5] or "",
             "notes": r[6] or "",
+            "current_signal": r[7] or "",
+            "confidence": float(conf) if conf is not None else None,
             "current_price": current,
             "pnl_pct": pnl,
         })
@@ -547,12 +566,18 @@ def build_trader_context(preferences: dict, stock_intents: list) -> str:
         context += "\nStock-specific intents:\n"
         for s in stock_intents:
             pnl_str = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "N/A"
+            sig = s.get("current_signal") or ""
+            conf = s.get("confidence")
+            conf_str = f"{conf:.2f}" if conf is not None else ""
+            extra = ""
+            if sig or conf_str:
+                extra = f" | signal: {sig}" + (f" (conf {conf_str})" if conf_str else "")
             context += (
                 f"- {s['symbol']}: avg {s['avg_buy_price']} | "
                 f"now {s['current_price']} ({pnl_str}) | "
                 f"intent: {s['intent']} | "
                 f"target: {s['target_price']} | "
-                f"timeframe: {s['timeframe']}\n"
+                f"timeframe: {s['timeframe']}{extra}\n"
             )
 
     return context

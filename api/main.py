@@ -858,26 +858,42 @@ def get_portfolio(trader_id: int):
             avg_px = float(avg_px or 0)
             invested = float(invested or 0)
 
-            # Current price
-            cur.execute(
-                "SELECT ltp, close FROM price_history WHERE symbol = %s ORDER BY date DESC LIMIT 1",
-                (sym,),
-            )
-            ph = cur.fetchone()
-            current_price = (_float(ph[0]) or _float(ph[1])) if ph else avg_px
-
-            # Current signal
+            # Today's analysis price (live tick in raw_output) with price_history fallback
             cur.execute(
                 """
-                SELECT DISTINCT ON (symbol) overall_signal
-                FROM analysis_results
-                WHERE symbol = %s
-                ORDER BY symbol, analysis_date DESC, session_no DESC NULLS LAST, id DESC
+                SELECT
+                    ar.overall_signal,
+                    COALESCE(
+                        NULLIF(trim(ar.raw_output->>'current_price'), '')::numeric,
+                        ph.ltp,
+                        ph.close
+                    ) AS current_price
+                FROM (SELECT 1) AS _
+                LEFT JOIN LATERAL (
+                    SELECT overall_signal, raw_output
+                    FROM analysis_results
+                    WHERE symbol = %s AND analysis_date = CURRENT_DATE
+                    ORDER BY session_no DESC NULLS LAST, id DESC
+                    LIMIT 1
+                ) ar ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT ltp, close
+                    FROM price_history
+                    WHERE symbol = %s
+                    ORDER BY date DESC
+                    LIMIT 1
+                ) ph ON TRUE
                 """,
-                (sym,),
+                (sym, sym),
             )
-            ar = cur.fetchone()
-            signal = ar[0] if ar else "HOLD"
+            row_px = cur.fetchone()
+            signal = "HOLD"
+            current_price = avg_px
+            if row_px:
+                signal = row_px[0] or "HOLD"
+                cp = _float(row_px[1])
+                if cp is not None:
+                    current_price = cp
 
             current_value = round(qty * current_price, 2)
             pnl_value = round(current_value - invested, 2)
@@ -1518,25 +1534,38 @@ def get_stock_intents(trader_id: int):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT
-                tsi.symbol, tsi.avg_buy_price, tsi.intent,
-                tsi.target_price, tsi.stop_price, tsi.timeframe,
-                tsi.notes, tsi.updated_at,
-                ph.ltp AS current_price,
-                ar.overall_signal, ar.confidence_score
+            SELECT DISTINCT ON (tsi.symbol)
+                tsi.symbol,
+                tsi.avg_buy_price,
+                tsi.intent,
+                tsi.target_price,
+                tsi.stop_price,
+                tsi.timeframe,
+                tsi.notes,
+                tsi.updated_at,
+                ar.overall_signal AS current_signal,
+                ar.confidence_score AS confidence,
+                COALESCE(
+                    NULLIF(trim(ar.raw_output->>'current_price'), '')::numeric,
+                    ph.ltp
+                ) AS current_price
             FROM trader_stock_intents tsi
             LEFT JOIN (
-                SELECT DISTINCT ON (symbol) symbol, ltp
+                SELECT DISTINCT ON (symbol)
+                    symbol, overall_signal, confidence_score, raw_output
+                FROM analysis_results
+                WHERE analysis_date = CURRENT_DATE
+                ORDER BY symbol, session_no DESC NULLS LAST, id DESC
+            ) ar ON tsi.symbol = ar.symbol
+            LEFT JOIN (
+                SELECT DISTINCT ON (symbol)
+                    symbol, ltp
                 FROM price_history
                 ORDER BY symbol, date DESC
             ) ph ON tsi.symbol = ph.symbol
-            LEFT JOIN (
-                SELECT DISTINCT ON (symbol) symbol, overall_signal, confidence_score
-                FROM analysis_results
-                ORDER BY symbol, analysis_date DESC, session_no DESC NULLS LAST, id DESC
-            ) ar ON tsi.symbol = ar.symbol
-            WHERE tsi.trader_id = %s AND tsi.is_active = TRUE
-            ORDER BY tsi.updated_at DESC
+            WHERE tsi.trader_id = %s
+              AND tsi.is_active = TRUE
+            ORDER BY tsi.symbol, tsi.updated_at DESC
             """,
             (trader_id,),
         )
@@ -1546,7 +1575,7 @@ def get_stock_intents(trader_id: int):
         intents = []
         for r in rows:
             avg = _float(r[1]) or 0.0
-            current = _float(r[8]) or 0.0
+            current = _float(r[10]) or 0.0
             pnl = round(((current - avg) / avg * 100), 2) if avg > 0 else 0.0
             intents.append({
                 "symbol": r[0],
@@ -1557,10 +1586,10 @@ def get_stock_intents(trader_id: int):
                 "timeframe": r[5] or "",
                 "notes": r[6] or "",
                 "updated_at": r[7].isoformat() if hasattr(r[7], "isoformat") else str(r[7]),
+                "current_signal": r[8] or "",
+                "confidence": _float(r[9]),
                 "current_price": current,
                 "pnl_pct": pnl,
-                "current_signal": r[9] or "",
-                "confidence": _float(r[10]),
             })
         return _jsonify({"trader_id": trader_id, "intents": intents})
     except Exception as e:
