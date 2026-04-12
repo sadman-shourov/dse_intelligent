@@ -289,60 +289,37 @@ def deliver_pulse(trader_id: int | None = None) -> dict[str, Any]:
             tid = t["id"]
             name = t["name"]
             chat = t["telegram_chat_id"]
-            latest = get_latest_pulse(conn, tid, target_date)
             telegram_message: str | None = None
             pulse_row_id: int | None = None
 
-            if latest is None:
-                from pulse.deepseek import generate_pulse
+            # Always generate fresh pulse (avoid reusing stale pulse_log rows)
+            from pulse.deepseek import generate_pulse
 
-                logger.info("No pulse_log for trader_id=%s on %s; generating pulse", tid, target_date)
-                result = generate_pulse(tid)
-                if result.get("status") != "ok":
-                    logger.warning(
-                        "generate_pulse failed for trader %s (%s): %s",
-                        tid,
-                        name,
-                        result,
-                    )
-                    failed += 1
-                    details.append(
-                        {
-                            "trader_id": tid,
-                            "name": name,
-                            "status": "skipped",
-                            "reason": result.get("status", "error"),
-                            "detail": result.get("message") or result.get("reason"),
-                        }
-                    )
-                    continue
-                telegram_message = result.get("telegram_message")
-                latest = get_latest_pulse(conn, tid, target_date)
-                if latest:
-                    pulse_row_id = latest["id"]
-            else:
-                pulse_row_id = latest["id"]
-                telegram_message = _build_message_from_pulse_log(
-                    conn, tid, target_date, latest["deepseek_output"]
+            logger.info("Generating fresh pulse for trader_id=%s on %s", tid, target_date)
+            result = generate_pulse(tid)
+            if result.get("status") != "ok":
+                logger.warning(
+                    "generate_pulse failed for trader %s (%s): %s",
+                    tid,
+                    name,
+                    result,
                 )
-                if telegram_message is None:
-                    logger.warning(
-                        "Pulse row %s for trader %s (%s) is not sendable; skipping Telegram",
-                        pulse_row_id,
-                        tid,
-                        name,
-                    )
-                    failed += 1
-                    details.append(
-                        {
-                            "trader_id": tid,
-                            "name": name,
-                            "status": "skipped",
-                            "reason": "unsendable_pulse_output",
-                            "pulse_id": pulse_row_id,
-                        }
-                    )
-                    continue
+                failed += 1
+                details.append(
+                    {
+                        "trader_id": tid,
+                        "name": name,
+                        "status": "skipped",
+                        "reason": result.get("status", "error"),
+                        "detail": result.get("message") or result.get("reason"),
+                    }
+                )
+                continue
+
+            telegram_message = result.get("telegram_message")
+
+            latest = get_latest_pulse(conn, tid, target_date)
+            pulse_row_id = latest["id"] if latest else None
 
             if not telegram_message or not str(telegram_message).strip():
                 logger.warning("Empty telegram_message for trader %s (%s); skip", tid, name)
