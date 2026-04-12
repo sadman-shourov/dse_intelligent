@@ -147,6 +147,7 @@ def root():
             {"path": "/refresh/analysis", "method": "POST", "description": "Refresh analysis only"},
             {"path": "/stock/search/{query}", "method": "GET", "description": "Search DSE stock symbol by name"},
             {"path": "/alerts/extreme-moves", "method": "POST", "description": "Check and send extreme move alerts"},
+            {"path": "/alerts/pipeline-failure", "method": "POST", "description": "Notify all active traders of a data pipeline failure"},
             # Pulse
             {"path": "/pulse/deliver/all", "method": "POST", "description": "Deliver latest pulse to all active traders via Telegram"},
             {"path": "/pulse/deliver/{trader_id}", "method": "POST", "description": "Deliver latest pulse to one trader via Telegram"},
@@ -324,6 +325,82 @@ def extreme_moves_endpoint(threshold_pct: float = 5.0):
     except Exception as e:
         logger.exception("extreme-moves endpoint error")
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/alerts/pipeline-failure")
+def pipeline_failure_alert():
+    """Send a failure alert to all active traders with Telegram chat IDs."""
+    conn = None
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'traders'
+            """
+        )
+        tcols = {r[0] for r in cur.fetchall()}
+        q = """
+            SELECT telegram_chat_id, COALESCE(name, '')
+            FROM traders
+            WHERE telegram_chat_id IS NOT NULL
+        """
+        if "is_active" in tcols:
+            q += " AND is_active = TRUE"
+        cur.execute(q)
+        traders = cur.fetchall()
+        cur.close()
+
+        import pytz
+
+        dhaka = pytz.timezone("Asia/Dhaka")
+        now = datetime.now(dhaka).strftime("%d %b %H:%M")
+
+        message = (
+            f"⚠️ <b>NexTrade System Alert</b>\n\n"
+            f"Data pipeline issue detected at {now}.\n"
+            f"Market pulse may be delayed.\n"
+            f"Our team is looking into it."
+        )
+
+        delivered = 0
+        for chat_id, name in traders:
+            try:
+                res = send_telegram_message(
+                    chat_id=str(chat_id),
+                    message=message,
+                    parse_mode="HTML",
+                )
+                if res.get("status") == "ok":
+                    delivered += 1
+            except Exception:
+                logger.exception(
+                    "pipeline_failure_alert: send failed for trader %s",
+                    name or chat_id,
+                )
+
+        return JSONResponse(
+            status_code=200,
+            content=_jsonify(
+                {
+                    "status": "ok",
+                    "alerted": len(traders),
+                    "delivered": delivered,
+                }
+            ),
+        )
+    except Exception as e:
+        logger.exception("pipeline_failure_alert error")
+        return JSONResponse(
+            status_code=500,
+            content=_jsonify(
+                {"status": "error", "message": str(e), "traceback": traceback.format_exc()}
+            ),
+        )
     finally:
         if conn:
             conn.close()
