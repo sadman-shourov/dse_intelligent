@@ -990,6 +990,8 @@ def format_telegram_message(
     analysis: dict,
     portfolio: list,
     target_date: date,
+    session_no: int = 0,
+    pulse_type: str = "eod",
     scorecard: dict | None = None,
 ) -> str:
     buy_count = int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or []))
@@ -998,10 +1000,16 @@ def format_telegram_message(
     total_a = analysis.get("total_analysed", 0)
 
     body = html.escape(_plain_text_for_telegram_body(deepseek_response or ""), quote=True)
-    header = (
-        "🎯 <b>NexTrade Market Pulse</b>\n"
-        f"📅 {html.escape(target_date.isoformat(), quote=True)} | DSE Trading Session"
-    )
+    if pulse_type == "premarket":
+        header = "🌅 <b>NexTrade Pre-Market Briefing</b>"
+        subheader = f"📅 {target_date.strftime('%a %d %b')} | Market opens at 10:00am"
+    elif pulse_type == "intraday":
+        header = f"📊 <b>NexTrade Intraday Pulse</b> — Session {session_no} of 10"
+        subheader = f"📅 {target_date.strftime('%d %b')} | Live market update"
+    else:
+        header = "🔔 <b>NexTrade EOD Summary</b>"
+        subheader = f"📅 {target_date.strftime('%a %d %b')} | Market closed"
+    header = f"{header}\n{subheader}"
 
     # NexTrade accuracy scorecard section
     sc = scorecard or {}
@@ -1092,6 +1100,14 @@ def generate_pulse(trader_id: int) -> dict:
     conn = get_db_connection()
     conn.autocommit = True
     session_no = _current_session_no_dhaka()
+    dhaka = pytz.timezone("Asia/Dhaka")
+    now = datetime.now(dhaka)
+    is_market_hours = (
+        now.weekday() < 5
+        and (now.hour > 10 or (now.hour == 10 and now.minute >= 0))
+        and (now.hour < 14 or (now.hour == 14 and now.minute <= 30))
+    )
+    pulse_type = "intraday" if is_market_hours else "eod"
     analysis: dict = {}
     portfolio: list = []
 
@@ -1170,7 +1186,13 @@ def generate_pulse(trader_id: int) -> dict:
         except Exception as e:
             deepseek_output = f"DeepSeek API error: {e}\n{traceback.format_exc()}"
             telegram_message = format_telegram_message(
-                deepseek_output, analysis, portfolio, target_date, scorecard=scorecard
+                deepseek_output,
+                analysis,
+                portfolio,
+                target_date,
+                session_no=session_no,
+                pulse_type=pulse_type,
+                scorecard=scorecard,
             )
             try:
                 _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -1189,7 +1211,13 @@ def generate_pulse(trader_id: int) -> dict:
             }
 
         telegram_message = format_telegram_message(
-            deepseek_output, analysis, portfolio, target_date, scorecard=scorecard
+            deepseek_output,
+            analysis,
+            portfolio,
+            target_date,
+            session_no=session_no,
+            pulse_type=pulse_type,
+            scorecard=scorecard,
         )
         try:
             _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -1442,18 +1470,21 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         except Exception as e:
             deepseek_output = f"DeepSeek API error: {e}"
 
-        # --- Format Telegram message ---
-        body = html.escape(_plain_text_for_telegram_body(deepseek_output), quote=True)
-        telegram_message = (
-            f"🌅 <b>NexTrade Pre-Market Briefing</b>\n"
-            f"📅 {html.escape(target_date.isoformat())} | Market opens in 5 minutes\n\n"
-            f"{body}\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💼 Positions: {len(portfolio)} | "
-            f"👁 Watchlist: {len(watchlist)} | "
-            f"📊 Yesterday BUY signals: {len(buy_signals)}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Powered by NexTrade</i>"
+        # --- Format Telegram message (shared header/footer with pulse formatter) ---
+        premarket_analysis = {
+            "buy_signal_total": len(buy_signals),
+            "watch_signal_total": len(watch_signals),
+            "exit_signals": [],
+            "total_analysed": 0,
+        }
+        telegram_message = format_telegram_message(
+            deepseek_output,
+            premarket_analysis,
+            portfolio,
+            target_date,
+            session_no=0,
+            pulse_type="premarket",
+            scorecard=None,
         )
 
         try:
