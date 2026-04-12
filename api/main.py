@@ -22,6 +22,7 @@ from ingestion.fetch_stock_fundamentals import fetch_stock_fundamentals
 from analysis.engine import analyse_all_symbols, analyse_symbol, detect_extreme_moves
 from analysis.evaluator import evaluate_past_signals, get_recent_scorecard, calculate_accuracy_scores
 from pulse.deepseek import generate_pulse, generate_premarket_briefing
+from api.health import check_data_freshness
 from pulse.telegram import deliver_pulse, deliver_premarket_briefing, send_telegram_message, deliver_extreme_move_alerts  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -110,10 +111,23 @@ def health():
     return {"status": "ok", "service": "ARIA Ingestion API", "version": "1.0.0"}
 
 
+@app.get("/health/data")
+def data_health_check():
+    conn = _get_conn()
+    try:
+        result = check_data_freshness(conn)
+        status_code = 200 if result["healthy"] else 503
+        return JSONResponse(status_code=status_code, content=_jsonify(result))
+    finally:
+        conn.close()
+
+
 @app.get("/")
 def root():
     return {
         "endpoints": [
+            # Health
+            {"path": "/health/data", "method": "GET", "description": "Data freshness for pulse (503 if unhealthy)"},
             # Ingestion
             {"path": "/ingest/sync-stocks", "method": "POST", "description": "Sync stocks master from bdshare"},
             {"path": "/ingest/append-price-history", "method": "POST", "description": "Append today's price history for all symbols"},

@@ -811,6 +811,7 @@ def build_pulse_prompt(
     trader_context: str = "",
     preferences: dict | None = None,
     stock_intents: list | None = None,
+    data_warning: str = "",
 ) -> tuple[str, str]:
     # Base rules from DB preferences + trader profile / intents on the system message
     prefs = preferences or {}
@@ -948,6 +949,11 @@ def build_pulse_prompt(
     if accuracy_context:
         lines.append("")
         lines.append(accuracy_context)
+
+    dw = (data_warning or "").strip()
+    if dw:
+        lines.append("")
+        lines.append(dw)
 
     return effective_system, "\n".join(lines)
 
@@ -1127,6 +1133,59 @@ def generate_pulse(trader_id: int) -> dict:
 
         actual_today = get_db_date(conn)
         target_date = actual_today
+
+        from api.health import check_data_freshness
+
+        health = check_data_freshness(conn)
+        data_warning = (
+            "NOTE: " + "; ".join(health["warnings"])
+            if health.get("warnings")
+            else ""
+        )
+        if not health["healthy"]:
+            from pulse.telegram import send_telegram_message
+
+            alert_msg = (
+                "⚠️ <b>NexTrade Data Alert</b>\n\n"
+                "Pulse generation paused — data issues detected:\n"
+            )
+            for issue in health["issues"]:
+                alert_msg += f"- {html.escape(issue)}\n"
+            alert_msg += "\nWill retry at next scheduled run."
+
+            skip = {
+                "status": "skipped",
+                "reason": "data_not_fresh",
+                "issues": health["issues"],
+                "warnings": health["warnings"],
+            }
+            try:
+                _insert_pulse_log(conn, trader_id, target_date, session_no, skip, json.dumps(skip))
+            except Exception:
+                pass
+
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT telegram_chat_id FROM traders WHERE id=%s",
+                    (trader_id,),
+                )
+                row = cur.fetchone()
+            finally:
+                cur.close()
+            if row and row[0]:
+                try:
+                    send_telegram_message(chat_id=str(row[0]), message=alert_msg)
+                except Exception as tg_err:
+                    logger.warning("Data alert Telegram send failed: %s", tg_err)
+
+            return {
+                "status": "skipped",
+                "reason": "data_not_fresh",
+                "issues": health["issues"],
+                "warnings": health["warnings"],
+            }
+
         analysis = get_analysis_summary(conn, target_date)
         # Always use actual today for market context, regardless of analysis fallback date
         analysis["market_context"] = get_market_context(conn, actual_today)
@@ -1178,6 +1237,7 @@ def generate_pulse(trader_id: int) -> dict:
             scorecard=scorecard, accuracy_context=accuracy_context,
             trader_context=trader_context,
             preferences=preferences, stock_intents=stock_intents,
+            data_warning=data_warning,
         )
         deepseek_input = {"system": system_msg, "user": user_msg}
 
