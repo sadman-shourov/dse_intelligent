@@ -1452,6 +1452,12 @@ def analyse_symbol(
             "overall_signal": signal,
             "confidence_score": confidence,
             "raw_output": {
+                "current_price": float(df["close"].iloc[-1])
+                if len(df) > 0
+                else None,
+                "current_ltp": float(df["ltp"].iloc[-1])
+                if "ltp" in df.columns and len(df) > 0
+                else None,
                 "sr": sr,
                 "breakout": breakout,
                 "fib": fib,
@@ -1802,6 +1808,8 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1:
         result = analyse_symbol(sys.argv[1])
+        if result.get("status") == "ok":
+            batch_upsert_analysis_results([result])
         print(json.dumps(result, indent=2, default=str))
     else:
         result = analyse_all_symbols()
