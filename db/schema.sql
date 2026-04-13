@@ -159,6 +159,18 @@ CREATE TABLE IF NOT EXISTS analysis_results (
 CREATE INDEX IF NOT EXISTS idx_analysis_results_symbol_date
     ON analysis_results(symbol, analysis_date DESC);
 
+CREATE TABLE IF NOT EXISTS extreme_move_alerts (
+    id          BIGSERIAL PRIMARY KEY,
+    symbol      VARCHAR(20) NOT NULL,
+    alert_date  DATE NOT NULL,
+    change_pct  NUMERIC(8,2),
+    direction   VARCHAR(10),
+    price       NUMERIC(10,2),
+    session_no  SMALLINT,
+    alerted_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(symbol, alert_date)
+);
+
 CREATE TABLE IF NOT EXISTS traders (
     id              BIGSERIAL PRIMARY KEY,
     name            VARCHAR(100),

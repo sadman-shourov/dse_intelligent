@@ -430,6 +430,46 @@ def deliver_pulse(trader_id: int | None = None) -> dict[str, Any]:
         conn.close()
 
 
+def get_already_alerted_today(conn, target_date: date) -> set[str]:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT symbol FROM extreme_move_alerts
+            WHERE alert_date = %s
+            """,
+            (target_date,),
+        )
+        return {row[0] for row in cur.fetchall()}
+    finally:
+        cur.close()
+
+
+def mark_symbols_alerted(conn, moves: list[dict], target_date: date) -> None:
+    cur = conn.cursor()
+    try:
+        for m in moves:
+            cur.execute(
+                """
+                INSERT INTO extreme_move_alerts
+                    (symbol, alert_date, change_pct, direction, price, session_no)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol, alert_date) DO NOTHING
+                """,
+                (
+                    m.get('symbol'),
+                    target_date,
+                    m.get('change_pct'),
+                    m.get('direction'),
+                    m.get('current_price'),
+                    m.get('session_no'),
+                ),
+            )
+        conn.commit()
+    finally:
+        cur.close()
+
+
 def send_extreme_move_alert(
     trader_id: int,
     chat_id: str,
@@ -480,21 +520,28 @@ def deliver_extreme_move_alerts(moves: list[dict]) -> dict:
         logger.exception("DB connection failed in deliver_extreme_move_alerts")
         return {"status": "error", "reason": str(e)}
 
-    conn.autocommit = True
+    conn.autocommit = False
     delivered = 0
     skipped = 0
     details: list[dict] = []
 
     try:
+        target_date = get_db_date(conn)
+        already_alerted = get_already_alerted_today(conn, target_date)
+        new_moves = [m for m in moves if m.get("symbol") not in already_alerted]
+
+        if not new_moves:
+            return {"status": "skipped", "reason": "all_already_alerted_today"}
+
         traders = get_active_traders(conn)
-        significant = [m for m in moves if abs(m["change_pct"]) >= 8.0]
+        significant = [m for m in new_moves if abs(m.get("change_pct") or 0.0) >= 8.0]
+        any_sent = False
 
         for t in traders:
             tid = t["id"]
             name = t["name"]
             chat = t["telegram_chat_id"]
 
-            # Fetch this trader's open portfolio symbols
             cur = conn.cursor()
             cur.execute(
                 """
@@ -506,16 +553,15 @@ def deliver_extreme_move_alerts(moves: list[dict]) -> dict:
             portfolio_symbols: set[str] = {r[0] for r in cur.fetchall()}
             cur.close()
 
-            portfolio_moves = [m for m in moves if m["symbol"] in portfolio_symbols]
+            portfolio_moves = [m for m in new_moves if m["symbol"] in portfolio_symbols]
 
-            # Only alert if they have a portfolio hit OR there's a >8% market move
             if not portfolio_moves and not significant:
                 skipped += 1
                 details.append({"trader_id": tid, "name": name, "status": "skipped", "reason": "no relevant moves"})
                 continue
 
             try:
-                res = send_extreme_move_alert(tid, chat, moves, portfolio_symbols)
+                res = send_extreme_move_alert(tid, chat, new_moves, portfolio_symbols)
             except Exception as e:
                 logger.exception("send_extreme_move_alert failed for trader %s", tid)
                 details.append({"trader_id": tid, "name": name, "status": "error", "error": str(e)})
@@ -523,14 +569,19 @@ def deliver_extreme_move_alerts(moves: list[dict]) -> dict:
 
             if res.get("status") == "ok":
                 delivered += 1
+                any_sent = True
                 logger.info("Extreme move alert delivered to trader %s (%s)", tid, name)
                 details.append({"trader_id": tid, "name": name, "status": "delivered", "message_id": res.get("message_id")})
             else:
                 details.append({"trader_id": tid, "name": name, "status": "failed", "error": res.get("error")})
 
+        if any_sent:
+            mark_symbols_alerted(conn, new_moves, target_date)
+
         return {
             "status": "ok",
             "moves_detected": len(moves),
+            "new_moves": len(new_moves),
             "traders_alerted": delivered,
             "traders_skipped": skipped,
             "details": details,

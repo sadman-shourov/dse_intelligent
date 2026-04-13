@@ -789,6 +789,8 @@ Follow these rules when giving advice.
 - For WATCH intents: flag when entry conditions are met
 - Always reference trader's avg buy price and show P&L clearly
 
+CRITICAL: You must ONLY reference portfolio positions that are explicitly listed in the TRADER PORTFOLIO section below. Never invent, assume, or reference any position not in that list. If the portfolio section shows 0 positions, say the portfolio is empty. If it shows 2 positions, only discuss those 2. Fabricating positions is a serious error.
+
 RESPONSE STRUCTURE:
 1. Market overview (2 sentences, specific levels)
 2. Top 2-3 market opportunities aligned with trader's style
@@ -884,6 +886,9 @@ def build_pulse_prompt(
         lines.append(f"- {e.get('symbol')} — {e.get('reason')}")
     lines.append("")
     lines.append(f"Trader portfolio ({len(portfolio)} positions):")
+    lines.append(f"[EXACT PORTFOLIO — {len(portfolio)} positions — reference ONLY these]")
+    if not portfolio:
+        lines.append("[PORTFOLIO IS EMPTY — trader has no open positions — do not invent any]")
     for p in portfolio:
         lines.append(
             f"- {p.get('symbol')}: {p.get('quantity')} shares @ avg {p.get('avg_buy_price')}\n"
@@ -892,6 +897,7 @@ def build_pulse_prompt(
         )
         if (p.get("pnl_pct") or 0) <= -8.0:
             lines.append("  Note: urgent exit — position exceeds -8% drawdown threshold")
+    lines.append("[END OF PORTFOLIO — do not reference any other stocks as portfolio positions]")
     lines.append("")
     lines.append(f"Watchlist ({len(watchlist)} stocks):")
     for w in watchlist:
@@ -991,6 +997,16 @@ def _plain_text_for_telegram_body(model_text: str) -> str:
     return t.strip()
 
 
+def get_session_label(session_no: int) -> str:
+    if session_no == -1:
+        return "Pre-Market Briefing"
+    if session_no == 0:
+        return "EOD Summary"
+    if 1 <= session_no <= 10:
+        return f"Intraday Pulse — Session {session_no} of 10"
+    return "Market Update"
+
+
 def format_telegram_message(
     deepseek_response: str,
     analysis: dict,
@@ -1006,15 +1022,16 @@ def format_telegram_message(
     total_a = analysis.get("total_analysed", 0)
 
     body = html.escape(_plain_text_for_telegram_body(deepseek_response or ""), quote=True)
-    if pulse_type == "premarket":
-        header = "🌅 <b>NexTrade Pre-Market Briefing</b>"
+    session_label = get_session_label(session_no)
+    header = f"📊 <b>NexTrade {session_label}</b>"
+    if session_no == -1:
         subheader = f"📅 {target_date.strftime('%a %d %b')} | Market opens at 10:00am"
-    elif pulse_type == "intraday":
-        header = f"📊 <b>NexTrade Intraday Pulse</b> — Session {session_no} of 10"
+    elif 1 <= session_no <= 10:
         subheader = f"📅 {target_date.strftime('%d %b')} | Live market update"
-    else:
-        header = "🔔 <b>NexTrade EOD Summary</b>"
+    elif session_no == 0:
         subheader = f"📅 {target_date.strftime('%a %d %b')} | Market closed"
+    else:
+        subheader = f"📅 {target_date.strftime('%a %d %b')} | Market update"
     header = f"{header}\n{subheader}"
 
     # NexTrade accuracy scorecard section
@@ -1042,10 +1059,11 @@ def format_telegram_message(
             "Building accuracy baseline — first week of live signals.\n"
         )
 
+    score_title = "Yesterday's signals" if session_no == -1 else "Signals today"
     score = (
         f"{scorecard_section}"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>Signals today</b>\n"
+        f"📊 <b>{score_title}</b>\n"
         f"Buy: {buy_count} | Watch: {watch_count} | Exit: {exit_count}\n"
         f"Stocks analysed: {total_a}\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -1067,6 +1085,25 @@ def _current_session_no_dhaka() -> int:
     if session_no < 1 or session_no > 10:
         return 0
     return session_no
+
+
+def pulse_already_sent(conn, trader_id: int, target_date: date, session_no: int) -> bool:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM pulse_log
+            WHERE trader_id = %s
+              AND pulse_date = %s
+              AND session_no = %s
+              AND telegram_sent = TRUE
+            """,
+            (trader_id, target_date, session_no),
+        )
+        row = cur.fetchone()
+        return bool(row and (row[0] or 0) > 0)
+    finally:
+        cur.close()
 
 
 def _insert_pulse_log(
@@ -1133,6 +1170,14 @@ def generate_pulse(trader_id: int) -> dict:
 
         actual_today = get_db_date(conn)
         target_date = actual_today
+
+        if pulse_already_sent(conn, trader_id, target_date, session_no):
+            return {
+                "status": "skipped",
+                "reason": "already_sent_this_session",
+                "trader_id": trader_id,
+                "session_no": session_no,
+            }
 
         from api.health import check_data_freshness
 
@@ -1335,6 +1380,16 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         cur.close()
 
         target_date = get_db_date(conn)
+        analysis_date = target_date - timedelta(days=1)
+        session_no = -1
+
+        if pulse_already_sent(conn, trader_id, target_date, session_no):
+            return {
+                "status": "skipped",
+                "reason": "already_sent_this_session",
+                "trader_id": trader_id,
+                "session_no": session_no,
+            }
 
         # --- Yesterday's market summary (last 2 rows to compute change) ---
         cur = conn.cursor()
@@ -1365,7 +1420,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
                     dsex_change = round((dsex - prev_dsex) / prev_dsex * 100, 2)
 
         # --- Yesterday's top BUY signals ---
-        yesterday = target_date - timedelta(days=1)
+        yesterday = analysis_date
         cur = conn.cursor()
         cur.execute(
             """
@@ -1427,6 +1482,8 @@ def generate_premarket_briefing(trader_id: int) -> dict:
                 "reason": reason,
             })
         watch_signals.sort(key=lambda x: x["confidence"], reverse=True)
+
+        analysis = get_analysis_summary(conn, analysis_date)
 
         # --- Portfolio and watchlist ---
         portfolio = get_trader_portfolio(conn, trader_id)
@@ -1532,23 +1589,23 @@ def generate_premarket_briefing(trader_id: int) -> dict:
 
         # --- Format Telegram message (shared header/footer with pulse formatter) ---
         premarket_analysis = {
-            "buy_signal_total": len(buy_signals),
-            "watch_signal_total": len(watch_signals),
-            "exit_signals": [],
-            "total_analysed": 0,
+            "buy_signal_total": int(analysis.get("buy_signal_total") or len(buy_signals)),
+            "watch_signal_total": int(analysis.get("watch_signal_total") or len(watch_signals)),
+            "exit_signals": analysis.get("exit_signals") or [],
+            "total_analysed": int(analysis.get("total_analysed") or 0),
         }
         telegram_message = format_telegram_message(
             deepseek_output,
             premarket_analysis,
             portfolio,
             target_date,
-            session_no=0,
+            session_no=session_no,
             pulse_type="premarket",
             scorecard=None,
         )
 
         try:
-            _insert_pulse_log(conn, trader_id, target_date, 0, deepseek_input, deepseek_output)
+            _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
         except Exception:
             pass
 

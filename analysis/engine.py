@@ -1314,6 +1314,7 @@ def analyse_symbol(
     live_ticks_today: list[dict] | None = None,  # full session list (CHANGE 2/3)
     market_context: dict | None = None,           # pre-computed context with dsex_change_pct
     market_trend: dict | None = None,             # multi-day trend from bulk_fetch_market_trend
+    prev_signals: dict[str, str] | None = None,
 ) -> dict:
     try:
         df = price_df.copy() if price_df is not None else get_price_history(symbol, days=90)
@@ -1425,6 +1426,20 @@ def analyse_symbol(
             market_trend=market_trend,
         )
 
+        # Stability filter for intraday session-to-session transitions.
+        prev_map = prev_signals or {}
+        if session_no is not None and session_no >= 2 and prev_map:
+            prev = prev_map.get(symbol)
+            if prev == 'BUY' and signal == 'EXIT':
+                signal = 'WATCH'
+                confidence = min(float(confidence or 0.0), 0.49)
+            if prev == 'EXIT' and signal == 'BUY':
+                signal = 'WATCH'
+                confidence = min(float(confidence or 0.0), 0.64)
+            if signal == 'BUY' and prev not in ('BUY', 'WATCH'):
+                signal = 'WATCH'
+                confidence = min(float(confidence or 0.0), 0.64)
+
         analysis_date = target_date.isoformat()
         current_price = _current_price(df)
         reason = build_signal_reason(
@@ -1495,6 +1510,7 @@ def analyse_symbol_with_data(
     target_date: date,
     market_context: dict | None = None,
     market_trend: dict | None = None,
+    prev_signals: dict[str, str] | None = None,
 ) -> dict:
     live_ticks_today = live_ticks_map.get(symbol, [])
     return analyse_symbol(
@@ -1509,6 +1525,7 @@ def analyse_symbol_with_data(
         live_ticks_today=live_ticks_today,
         market_context=market_context,
         market_trend=market_trend,
+        prev_signals=prev_signals,
     )
 
 
@@ -1679,6 +1696,30 @@ def _compute_session_no() -> int:
     return max(1, min(10, session_no))
 
 
+def bulk_fetch_previous_signals(conn, target_date: date, session_no: int) -> dict[str, str]:
+    """Fetch previous session overall_signal per symbol for stability filtering."""
+    if session_no <= 1:
+        return {}
+
+    prev_session = session_no - 1
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (symbol)
+                symbol, overall_signal
+            FROM analysis_results
+            WHERE analysis_date = %s
+              AND session_no = %s
+            ORDER BY symbol, id DESC
+            """,
+            (target_date, prev_session),
+        )
+        return {r[0]: r[1] for r in cur.fetchall() if r[0] and r[1]}
+    finally:
+        cur.close()
+
+
 def analyse_all_symbols() -> dict:
     start = time.time()
     run_session_no = _compute_session_no()
@@ -1708,6 +1749,11 @@ def analyse_all_symbols() -> dict:
     today_mkt, prev_mkt = bulk_fetch_market_summary()
     market_ctx = bulk_fetch_market_context(target_date)
     market_trend = bulk_fetch_market_trend()
+    conn_prev = get_db_connection()
+    try:
+        prev_signals = bulk_fetch_previous_signals(conn_prev, target_date, run_session_no)
+    finally:
+        conn_prev.close()
     print(f"Market trend: {market_trend['trend']} | 5d change: {market_trend['dsex_5d_change_pct']}%")
 
     symbols = [s for s in symbols if s in price_history_map]
@@ -1736,6 +1782,7 @@ def analyse_all_symbols() -> dict:
         target_date=target_date,
         market_context=market_ctx,
         market_trend=market_trend,
+        prev_signals=prev_signals,
     )
 
     processed = 0

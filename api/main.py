@@ -204,6 +204,10 @@ def ingest_live_ticks_endpoint():
     if result.get("status") == "error":
         return JSONResponse(status_code=500, content=result)
 
+    if result.get("status") == "ok":
+        mkt_result = fetch_market_summary()
+        result["market_summary_updated"] = mkt_result.get("status")
+
     # Check for extreme moves after successful ingest
     conn = None
     extreme_result: dict = {}
