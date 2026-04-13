@@ -19,6 +19,122 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+
+SYSTEM_PROMPT = """
+You are NexTrade — a sharp, no-nonsense DSE
+trading intelligence assistant. You speak like
+a seasoned trader giving advice to a friend,
+not a robot generating a report.
+
+TONE RULES:
+- Direct and confident. Never wishy-washy.
+- Short punchy sentences. Maximum 12 words per sentence.
+- Use CAPS for emphasis on the most important action.
+- Write like you are texting a friend who trades.
+- Never use corporate or financial jargon.
+- Never say "it is worth noting" or "one should consider"
+- Say "buy now" not "consider initiating a long position"
+- Say "get out" not "consider reducing exposure"
+- Say "this is the one" when confidence is high
+- Say "not ready yet" when setup is forming
+- Be honest about risk — never sugarcoat a loss
+
+FORMATTING RULES:
+- Use emojis functionally:
+  🟢 = positive/good/up
+  🔴 = negative/bad/down
+  🟡 = neutral/caution/watch
+  🎯 = target/goal/setup
+  🚨 = urgent/alert/critical
+  💰 = profit/target hit
+  🛑 = stop loss/hard line
+  ⚠️ = warning/approaching danger
+  📥 = entry/buy
+  📤 = exit/sell
+  💼 = portfolio
+  👀 = watching/monitoring
+  📌 = pinned/noteworthy
+  ✔ = confirmed/checked
+  👉 = action required
+  ⚖️ = risk reward
+  🚀 = strong upside
+  💎 = high conviction setup
+
+- Structure every message with these sections
+  (only include sections relevant to the trigger):
+
+  [MARKET CONTEXT] — one line, DSEX + direction
+  [MAIN ALERT] — the primary reason for this message
+  [SETUP DETAILS] — entry, targets, stop if trade alert
+  [WHY NOW] — 2-3 bullet reasons
+  [WATCHING] — other setups forming (brief)
+  [YOUR PORTFOLIO] — positions with status
+  [ONE THING TO DO] — single clear action
+
+- Always end with "ONE THING TO DO RIGHT NOW"
+  This is the most important section.
+  One sentence. One action. No ambiguity.
+
+- Use separator lines between sections:
+  ━━━━━━━━━━━━━━━━━━━━━
+
+PORTFOLIO STATUS RULES:
+- Up > 5%: "🟢 Running well · hold"
+- Up 2-5%: "🟢 In profit · hold"
+- Up 0-2%: "🟡 Slightly up · hold"
+- Flat: "🟡 Flat · hold"
+- Down 0-3%: "🟡 Slight dip · hold"
+- Down 3-6%: "🔴 Under pressure · watch"
+- Down 6-8%: "⚠️ Approaching stop · prepare to exit"
+- Down >8%: "🚨 STOP LOSS HIT · EXIT NOW"
+
+SETUP URGENCY LANGUAGE:
+- NOW: "THIS IS THE ONE" or "MOVE NOW"
+- WATCH: "Not ready yet · next session"
+- FORMING: "Keep this on your radar"
+
+SIGNAL TYPE LANGUAGE:
+- BREAKOUT: "just broke out" / "breaking resistance"
+- SUPPORT_BOUNCE: "bouncing off support" /
+  "holding key level"
+- OVERSOLD_REVERSAL: "oversold and turning" /
+  "reversal forming"
+- MOMENTUM_CONTINUATION: "still has legs" /
+  "momentum building"
+
+CRITICAL PORTFOLIO RULES:
+- ONLY mention positions that exist in the
+  EXACT PORTFOLIO section provided
+- Never invent positions
+- Never mention stocks not in the portfolio
+  as if the trader owns them
+- If portfolio is empty say:
+  "💼 No open positions · capital ready to deploy"
+
+MAX LENGTH: 300 words total per message
+"""
+
+PREMARKET_INSTRUCTIONS = """
+For pre-market messages:
+- Open with market mood in one line
+- List today's top 3 setups to watch
+- Review portfolio positions briefly
+- End with: what is the ONE thing to focus on today
+- Tone: like a coach giving the team talk
+  before the game starts
+"""
+
+EOD_INSTRUCTIONS = """
+For EOD messages:
+- Open with how the day went in one line
+- Highlight what worked and what didn't
+- Update portfolio with final day P&L
+- Preview tomorrow's setups if any
+- End with: one thing to prepare for tomorrow
+- Tone: like a coach reviewing the game after
+  it ends — honest, constructive, forward-looking
+"""
+
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
@@ -337,6 +453,8 @@ def get_analysis_summary(conn, target_date: date) -> dict:
             ov = overall or ""
             db_reason = pick_signal_reason(symbol, ov)
             reason = db_reason or reason_from_breakout(raw)
+            ts = raw.get("trade_setup")
+            trade_setup = ts if isinstance(ts, dict) else {}
             entry = {
                 "symbol": symbol,
                 "confidence": confidence,
@@ -347,6 +465,7 @@ def get_analysis_summary(conn, target_date: date) -> dict:
                 "rsi": _float_or_none(rsi),
                 "current_price": current_price,
                 "class_flags": class_flags,
+                "trade_setup": trade_setup,
             }
             if overall == "BUY":
                 buy_signals.append(entry)
@@ -439,148 +558,6 @@ def _enrich_position_row(cur, symbol: str, quantity: int, avg_buy_price: float) 
         "signal": signal,
         "reason": reason or "",
     }
-
-
-def get_trader_preferences(conn, trader_id: int) -> dict:
-    """Fetch trader preferences by joining traders + trader_preferences."""
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT
-                t.name,
-                t.trading_style,
-                t.holding_period,
-                t.risk_tolerance,
-                t.strategy_notes,
-                t.onboarding_complete,
-                tp.preferred_signals,
-                tp.avoid_signals,
-                tp.notes AS detailed_notes
-            FROM traders t
-            LEFT JOIN trader_preferences tp ON t.id = tp.trader_id
-            WHERE t.id = %s
-            """,
-            (trader_id,),
-        )
-        row = cur.fetchone()
-    finally:
-        cur.close()
-
-    if not row:
-        return {}
-    return {
-        "name": row[0] or f"Trader {trader_id}",
-        "trading_style": row[1] or "not specified",
-        "holding_period": row[2] or "not specified",
-        "risk_tolerance": row[3] or "moderate",
-        "strategy_notes": row[4] or "",
-        "onboarding_complete": bool(row[5]),
-        "preferred_signals": row[6] or "",
-        "avoid_signals": row[7] or "",
-        "detailed_notes": row[8] or "",
-    }
-
-
-def get_trader_stock_intents(conn, trader_id: int) -> list:
-    """Fetch active stock intents; price from today's analysis (live tick) with price_history fallback."""
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            SELECT DISTINCT ON (tsi.symbol)
-                tsi.symbol,
-                tsi.avg_buy_price,
-                tsi.intent,
-                tsi.target_price,
-                tsi.stop_price,
-                tsi.timeframe,
-                tsi.notes,
-                ar.overall_signal AS current_signal,
-                ar.confidence_score AS confidence,
-                COALESCE(
-                    NULLIF(trim(ar.raw_output->>'current_price'), '')::numeric,
-                    ph.ltp
-                ) AS current_price
-            FROM trader_stock_intents tsi
-            LEFT JOIN (
-                SELECT DISTINCT ON (symbol)
-                    symbol, overall_signal, confidence_score, raw_output
-                FROM analysis_results
-                WHERE analysis_date = CURRENT_DATE
-                ORDER BY symbol, session_no DESC NULLS LAST, id DESC
-            ) ar ON tsi.symbol = ar.symbol
-            LEFT JOIN (
-                SELECT DISTINCT ON (symbol)
-                    symbol, ltp
-                FROM price_history
-                ORDER BY symbol, date DESC
-            ) ph ON tsi.symbol = ph.symbol
-            WHERE tsi.trader_id = %s
-              AND tsi.is_active = TRUE
-            ORDER BY tsi.symbol, tsi.updated_at DESC
-            """,
-            (trader_id,),
-        )
-        rows = cur.fetchall()
-    finally:
-        cur.close()
-
-    intents = []
-    for r in rows:
-        avg = float(r[1]) if r[1] else 0.0
-        current = float(r[9]) if r[9] is not None else 0.0
-        pnl = round(((current - avg) / avg * 100), 2) if avg > 0 else 0.0
-        conf = r[8]
-        intents.append({
-            "symbol": r[0],
-            "avg_buy_price": avg,
-            "intent": r[2],
-            "target_price": float(r[3]) if r[3] else None,
-            "stop_price": float(r[4]) if r[4] else None,
-            "timeframe": r[5] or "",
-            "notes": r[6] or "",
-            "current_signal": r[7] or "",
-            "confidence": float(conf) if conf is not None else None,
-            "current_price": current,
-            "pnl_pct": pnl,
-        })
-    return intents
-
-
-def build_trader_context(preferences: dict, stock_intents: list) -> str:
-    """Build personalised trader context string for injection into DeepSeek prompt."""
-    if not preferences:
-        return ""
-
-    context = (
-        f"Trader profile:\n"
-        f"Name: {preferences.get('name', 'Trader')}\n"
-        f"Style: {preferences.get('trading_style', 'not specified')}\n"
-        f"Holding period: {preferences.get('holding_period', 'not specified')}\n"
-        f"Risk tolerance: {preferences.get('risk_tolerance', 'moderate')}\n"
-        f"Strategy: {preferences.get('strategy_notes', 'none provided')}\n"
-    )
-
-    if stock_intents:
-        context += "\nStock-specific intents:\n"
-        for s in stock_intents:
-            pnl_str = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "N/A"
-            sig = s.get("current_signal") or ""
-            conf = s.get("confidence")
-            conf_str = f"{conf:.2f}" if conf is not None else ""
-            extra = ""
-            if sig or conf_str:
-                extra = f" | signal: {sig}" + (f" (conf {conf_str})" if conf_str else "")
-            context += (
-                f"- {s['symbol']}: avg {s['avg_buy_price']} | "
-                f"now {s['current_price']} ({pnl_str}) | "
-                f"intent: {s['intent']} | "
-                f"target: {s['target_price']} | "
-                f"timeframe: {s['timeframe']}{extra}\n"
-            )
-
-    return context
 
 
 def get_trader_portfolio(conn, trader_id: int) -> list[dict]:
@@ -690,129 +667,6 @@ def get_trader_watchlist(conn, trader_id: int) -> list[dict]:
         return out
     finally:
         cur.close()
-
-
-def build_system_prompt(preferences: dict) -> str:
-    """Build system prompt dynamically from trader preferences stored in DB."""
-    raw_style = preferences.get("trading_style") or "swing"
-    trading_style = str(raw_style).strip().lower() if raw_style is not None else "swing"
-    if trading_style in ("", "not specified", "none"):
-        trading_style = "swing"
-
-    raw_risk = preferences.get("risk_tolerance") or "moderate"
-    risk_tolerance = str(raw_risk).strip().lower() if raw_risk is not None else "moderate"
-    if risk_tolerance not in ("conservative", "moderate", "aggressive"):
-        risk_tolerance = "moderate"
-
-    holding_period = preferences.get("holding_period") or "days to weeks"
-    holding_period = str(holding_period).strip() if holding_period is not None else "days to weeks"
-    if holding_period.lower() in ("", "not specified", "none"):
-        holding_period = "days to weeks"
-
-    strategy_notes = str(preferences.get("strategy_notes") or "").strip()
-
-    prompt = """You are NexTrade, a DSE trading intelligence assistant. Generate a sharp, personalised market pulse.
-
-CRITICAL FORMATTING RULES:
-- Plain text only
-- No ALL CAPS anywhere
-- No asterisks, no markdown, no bullet symbols
-- Use plain dashes for lists
-- Sentence case throughout
-- Max 400 words
-- Always use actual price levels
-- Never use HTML or angle-bracket tags in your reply (no <b>, </b>, <i>, etc.)
-- Write stock symbols and emphasis as plain words only; the app formats the outer Telegram message
-
-"""
-
-    if trading_style == "position":
-        prompt += f"""TRADER IS A POSITION TRADER:
-- Holding period: {holding_period}
-- Never suggest scalps or intraday trades
-- Never suggest "short-term bounce" plays
-- Focus on multi-week/month setups only
-- Exits should be at resistance zones, not arbitrary percentages
-- Respect stated HOLD intents unless there is a clear structural breakdown (price closes below major support on high volume)
-- Wider stop context — trader accepts drawdowns if thesis is intact
-
-"""
-    elif trading_style == "swing":
-        prompt += f"""TRADER IS A SWING TRADER:
-- Holding period: {holding_period}
-- Focus on 5-15 day momentum setups
-- Clear entry and exit levels required
-- Tighter stops acceptable
-
-"""
-    elif trading_style == "intraday":
-        prompt += """TRADER IS AN INTRADAY TRADER:
-- Focus on today's volume spikes and breakouts
-- Tight stops — preserve capital
-- Only high conviction setups
-
-"""
-
-    if risk_tolerance == "conservative":
-        prompt += """RISK PROFILE: CONSERVATIVE
-- Always lead with downside risk
-- Flag any position down more than 5% as requiring attention
-- Prefer capital preservation over gains
-
-"""
-    elif risk_tolerance == "moderate":
-        prompt += """RISK PROFILE: MODERATE
-- Balance risk and reward in all advice
-- Flag positions down more than 8% as urgent
-- Can hold through moderate drawdowns
-
-"""
-    elif risk_tolerance == "aggressive":
-        prompt += """RISK PROFILE: AGGRESSIVE
-- Can highlight higher risk/reward setups
-- Flag positions down more than 12% as urgent
-- Trader accepts volatility for bigger gains
-
-"""
-
-    if strategy_notes:
-        prompt += f"""TRADER'S OWN STRATEGY NOTES:
-{strategy_notes}
-Follow these rules when giving advice.
-
-"""
-
-    prompt += """STOCK INTENT RULES:
-- For each stock in trader's intents section: give personalised advice aligned with their stated plan
-- Never contradict a HOLD intent unless price has closed below major support
-- For EXIT intents: flag when bounce or resistance levels are reached
-- For WATCH intents: flag when entry conditions are met
-- Always reference trader's avg buy price and show P&L clearly
-
-CRITICAL: You must ONLY reference portfolio positions that are explicitly listed in the TRADER PORTFOLIO section below. Never invent, assume, or reference any position not in that list. If the portfolio section shows 0 positions, say the portfolio is empty. If it shows 2 positions, only discuss those 2. Fabricating positions is a serious error.
-
-CRITICAL: Every pulse must open with a FRESH observation specific to THIS session. You are FORBIDDEN from using the same opening sentence as any previous session.
-
-For each session observe:
-- Is DSEX up or down vs yesterday's close?
-- Is volume for this session higher or lower than the previous session?
-- Which sector is leading today?
-- What is the intraday trend so far (up/flat/down)?
-
-Open with ONE of these observations — rotate them.
-Never start two consecutive pulses the same way.
-
-For positions flagged CRITICAL or URGENT, do NOT repeat the same advice from previous sessions. Instead ESCALATE — use stronger language each time. If a position has been flagged 5+ times, the trader is ignoring the advice. Address this directly and firmly.
-
-RESPONSE STRUCTURE:
-1. Market overview (2 sentences, specific levels)
-2. Top 2-3 market opportunities aligned with trader's style
-3. Portfolio review — every stock in their intents with personalised one-line advice
-4. One key risk reminder
-
-"""
-
-    return prompt
 
 
 def get_top_movers_today(conn, session_no: int, limit: int = 3) -> list[dict]:
@@ -1112,228 +966,396 @@ def get_scorecard_data(conn, trader_id: int) -> dict:
     return base
 
 
-def build_pulse_prompt(
-    analysis: dict,
-    portfolio: list[dict],
-    watchlist: list[dict],
-    trader_id: int,
-    target_date: date,
-    scorecard: dict | None = None,
-    accuracy_context: str = "",
-    trader_context: str = "",
-    preferences: dict | None = None,
-    stock_intents: list | None = None,
-    data_warning: str = "",
-    conn=None,
-    session_no: int = 0,
-) -> tuple[str, str]:
-    # Base rules from DB preferences + trader profile / intents on the system message
-    prefs = preferences or {}
-    intents = stock_intents or []
-    base_system = build_system_prompt(prefs)
-    personalisation_rules = (trader_context or "").strip()
-    if not personalisation_rules:
-        personalisation_rules = build_trader_context(prefs, intents).strip()
-    effective_system = base_system
-    if personalisation_rules:
-        effective_system = base_system + "\n\n" + personalisation_rules + "\n"
-
-    mc = analysis.get("market_context") or {}
-    dsex = mc.get("dsex_index")
-    vol = mc.get("total_volume")
-    tvm = mc.get("total_value_mn")
-
-    buys = sorted(analysis.get("buy_signals") or [], key=lambda x: x["confidence"], reverse=True)[:5]
-    watches = sorted(analysis.get("watch_signals") or [], key=lambda x: x["confidence"], reverse=True)[:5]
-    exits = analysis.get("exit_signals") or []
-    buy_total = int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or []))
-
-    if mc.get("is_stale") or dsex is None:
-        market_line = "Market index data unavailable today."
-    else:
-        market_line = f"DSEX: {dsex} | Volume: {int(vol or 0):,} | Value: {tvm}mn"
-
-    # Market trend context
-    trend_data = analysis.get("market_trend") or {}
-    if trend_data and trend_data.get("trend", "unknown") != "unknown":
-        _td = str(trend_data.get("trend", "unknown")).replace("_", " ").strip()
-        trend_direction = _td.title() if _td else "Unknown"
-        trend_line = (
-            f"Market trend:\n"
-            f"Direction: {trend_direction}\n"
-            f"Consecutive down days: {trend_data.get('consecutive_down_days', 0)}\n"
-            f"5-day DSEX change: {trend_data.get('dsex_5d_change_pct', 0):+.1f}%"
+def _compute_dsex_change_pct(conn, target_date: date) -> float | None:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT dsex_index FROM market_summary
+            WHERE trade_date <= %s
+            ORDER BY trade_date DESC
+            LIMIT 2
+            """,
+            (target_date,),
         )
-    else:
-        trend_line = ""
+        rows = cur.fetchall()
+        if len(rows) < 2:
+            return None
+        t0 = _float_or_none(rows[0][0])
+        t1 = _float_or_none(rows[1][0])
+        if t1 and t1 != 0 and t0 is not None:
+            return round((t0 - t1) / t1 * 100.0, 2)
+        return None
+    finally:
+        cur.close()
 
-    lines: list[str] = []
-    lines.append(f"DATE: {target_date.isoformat()}")
-    lines.append("")
-    lines.append("Market overview:")
-    lines.append(market_line)
-    if trend_line:
-        lines.append("")
-        lines.append(trend_line)
 
-    dsex_change_pct = 0.0
-    if isinstance(mc.get("dsex_change_pct"), (int, float)):
-        dsex_change_pct = float(mc.get("dsex_change_pct") or 0.0)
-    else:
-        dsex_now = _float_or_none(mc.get("dsex_index"))
-        dsex_prev = _float_or_none((mc.get("previous") or {}).get("dsex_index"))
-        if dsex_now is not None and dsex_prev not in (None, 0):
-            dsex_change_pct = ((dsex_now - dsex_prev) / dsex_prev) * 100.0
+def enrich_market_context_pulse(conn, target_date: date, base: dict | None) -> dict:
+    out = dict(base or {})
+    chg = _compute_dsex_change_pct(conn, target_date)
+    if chg is not None:
+        out["dsex_change_pct"] = chg
+    return out
 
-    intraday_trend = str((analysis.get("market_trend") or {}).get("trend") or "unknown").replace("_", " ")
-    vol_now = _float_or_none(mc.get("total_volume")) or 0.0
-    vol_prev = _float_or_none((mc.get("previous") or {}).get("total_volume")) or 0.0
-    if vol_prev > 0:
-        vol_delta = ((vol_now - vol_prev) / vol_prev) * 100.0
-        vol_comparison = f"{vol_delta:+.1f}% vs yesterday"
-    else:
-        vol_comparison = "n/a"
 
-    movers = get_top_movers_today(conn, session_no, limit=3)
-    movers_str = ", ".join(
-        f"{m.get('symbol')} ({(m.get('change_pct') or 0):+.2f}%)" for m in movers
-    ) if movers else "n/a"
+def _fetch_buy_setups_for_session(
+    conn, target_date: date, session_no: int, urgency: str
+) -> list[dict]:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT symbol, raw_output->'trade_setup' AS setup
+            FROM analysis_results
+            WHERE analysis_date = %s
+              AND session_no = %s
+              AND overall_signal = 'BUY'
+              AND COALESCE(raw_output->'trade_setup'->>'has_setup', '') IN ('true', 'True')
+              AND raw_output->'trade_setup'->>'urgency' = %s
+              AND (raw_output->'trade_setup'->>'rr_1')::numeric >= 1.5
+            """,
+            (target_date, session_no, urgency),
+        )
+        out: list[dict] = []
+        for sym, setup in cur.fetchall():
+            s = setup if isinstance(setup, dict) else _parse_json_dict(setup)
+            out.append({"symbol": sym, "setup": s})
+        return out
+    finally:
+        cur.close()
 
-    prev_counts = get_previous_session_counts(conn, target_date, session_no)
 
-    lines.append("")
-    lines.append("INTRADAY CONTEXT (use this for your opening):")
-    lines.append(f"Session: {session_no} of 10")
-    lines.append(f"Intraday trend so far: {intraday_trend}")
-    lines.append(f"Volume vs yesterday: {vol_comparison}")
-    lines.append(f"Top movers this session: {movers_str}")
-    lines.append(f"DSEX change today: {dsex_change_pct:+.2f}%")
-    lines.append(
-        f"Previous session signal count: BUY {prev_counts['buy']} WATCH {prev_counts['watch']} EXIT {prev_counts['exit']}"
+def _setup_symbols(rows: list[dict]) -> set[str]:
+    return {str(r["symbol"]) for r in rows if r.get("symbol")}
+
+
+def _latest_price_for_symbol(cur, symbol: str) -> float | None:
+    cur.execute(
+        """
+        SELECT ltp, close FROM price_history
+        WHERE symbol = %s
+        ORDER BY date DESC
+        LIMIT 1
+        """,
+        (symbol,),
     )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return _float_or_none(row[0]) or _float_or_none(row[1])
 
-    lines.append("")
-    lines.append(f"Top buy signals today ({buy_total}):")
-    for b in buys:
-        cp = float(b.get("current_price") or 0.0)
-        sl = cp * 0.92
-        conf_pct = (b.get("confidence") or 0) * 100.0
-        lines.append(
-            f"- {b.get('symbol')} ({b.get('stock_class')}) @ {cp}\n"
-            f"  Signal: {b.get('reason')}\n"
-            f"  Support: {b.get('support')} | Resistance: {b.get('resistance')}\n"
-            f"  RSI: {b.get('rsi')} | Confidence: {conf_pct:.0f}%\n"
-            f"  Stop-loss: {sl:.2f}"
-        )
-    lines.append("")
-    lines.append("Watch list signals (top 5):")
-    for w in watches:
-        lines.append(f"- {w.get('symbol')} @ {w.get('current_price')} — {w.get('reason')}")
-    lines.append("")
-    lines.append("Exit signals:")
-    for e in exits:
-        lines.append(f"- {e.get('symbol')} — {e.get('reason')}")
-    lines.append("")
-    lines.append(f"Trader portfolio ({len(portfolio)} positions):")
-    lines.append(f"[EXACT PORTFOLIO — {len(portfolio)} positions — reference ONLY these]")
-    if not portfolio:
-        lines.append("[PORTFOLIO IS EMPTY — trader has no open positions — do not invent any]")
-    for p in portfolio:
-        lines.append(
-            f"- {p.get('symbol')}: {p.get('quantity')} shares @ avg {p.get('avg_buy_price')}\n"
-            f"  Current: {p.get('current_price')} | P&L: {p.get('pnl_pct'):+.1f}% ({p.get('pnl_value'):+.0f} BDT)\n"
-            f"  Signal: {p.get('signal')} — {p.get('reason')}"
-        )
-        if (p.get("pnl_pct") or 0) <= -8.0:
-            alert_count = get_position_alert_count(conn, trader_id, str(p.get("symbol")), target_date)
-            pnl_v = float(p.get("pnl_pct") or 0.0)
-            sym = str(p.get("symbol") or "UNKNOWN")
-            if alert_count >= 5:
-                urgency_text = (
-                    f"🚨 CRITICAL — {sym} DOWN {pnl_v:.1f}% FOR {alert_count} CONSECUTIVE SESSIONS. "
-                    f"IMMEDIATE EXIT REQUIRED. EVERY SESSION YOU HOLD INCREASES YOUR LOSS."
-                )
-            elif alert_count >= 3:
-                urgency_text = (
-                    f"⚠️ URGENT — {sym} DOWN {pnl_v:.1f}% FOR {alert_count} SESSIONS. "
-                    f"EXIT ON NEXT AVAILABLE PRICE. NO EXCEPTIONS."
-                )
-            else:
-                urgency_text = (
-                    f"❗ ALERT — {sym} DOWN {pnl_v:.1f}%. "
-                    f"STOP-LOSS THRESHOLD BREACHED. REVIEW POSITION."
-                )
-            lines.append(f"  {urgency_text}")
-    lines.append("[END OF PORTFOLIO — do not reference any other stocks as portfolio positions]")
-    lines.append("")
-    lines.append(f"Watchlist ({len(watchlist)} stocks):")
-    for w in watchlist:
-        lines.append(
-            f"- {w.get('symbol')} — Current: {w.get('current_price')} | Signal: {w.get('signal')}"
-        )
 
-    # Stock-specific intents from trader preferences
-    intents = stock_intents or []
-    if intents:
-        lines.append("")
-        lines.append(f"Trader stock intents ({len(intents)}):")
-        for s in intents:
-            pnl_str = f"{s['pnl_pct']:+.1f}%" if s.get("pnl_pct") is not None else "N/A"
-            target = s.get("target_price")
-            stop = s.get("stop_price")
-            lines.append(
-                f"- {s['symbol']}: avg buy {s['avg_buy_price']} | now {s['current_price']} ({pnl_str}) | "
-                f"intent: {s['intent']} | target: {target} | stop: {stop} | timeframe: {s.get('timeframe', '')}"
+def _latest_overall_signal(conn, symbol: str, analysis_date: date) -> str | None:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT overall_signal
+            FROM analysis_results
+            WHERE symbol = %s AND analysis_date = %s
+            ORDER BY session_no DESC NULLS LAST, id DESC
+            LIMIT 1
+            """,
+            (symbol, analysis_date),
+        )
+        row = cur.fetchone()
+        return (row[0] or None) if row else None
+    finally:
+        cur.close()
+
+
+def _trader_intent_targets(cur, trader_id: int, symbol: str) -> tuple[float | None, float | None]:
+    if not _table_exists(cur, "trader_stock_intents"):
+        return None, None
+    cur.execute(
+        """
+        SELECT target_price, stop_price
+        FROM trader_stock_intents
+        WHERE trader_id = %s AND symbol = %s AND is_active = TRUE
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        (trader_id, symbol),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    return _float_or_none(row[0]), _float_or_none(row[1])
+
+
+def should_send_pulse(
+    conn,
+    trader_id: int,
+    target_date,
+    session_no: int,
+    analysis_summary: dict,
+    portfolio: list,
+    market_context: dict,
+) -> tuple[bool, str, dict]:
+    """Returns (should_send, reason, meta) for proactive pulses."""
+    meta: dict[str, Any] = {}
+
+    # --- Check 1: portfolio urgency ---
+    cur = conn.cursor()
+    try:
+        for p in portfolio or []:
+            sym = str(p.get("symbol") or "")
+            if not sym:
+                continue
+            pnl = float(p.get("pnl_pct") or 0.0)
+            if pnl <= -7.5:
+                meta.update({"symbol": sym, "pnl_pct": pnl, "current_price": p.get("current_price")})
+                tgt, stp = _trader_intent_targets(cur, trader_id, sym)
+                meta["stop_price"] = stp
+                return True, "portfolio_stop_loss_alert", meta
+
+            sig = _latest_overall_signal(conn, sym, target_date)
+            if sig == "EXIT":
+                meta.update({"symbol": sym, "signal": sig})
+                return True, "portfolio_exit_signal", meta
+
+            latest_px = _latest_price_for_symbol(cur, sym)
+            if latest_px is None:
+                latest_px = _float_or_none(p.get("current_price"))
+            target_px, _stp = _trader_intent_targets(cur, trader_id, sym)
+            if target_px is not None and latest_px is not None and latest_px >= target_px:
+                meta.update(
+                    {
+                        "symbol": sym,
+                        "target_price": target_px,
+                        "pnl_pct": pnl,
+                        "current_price": latest_px,
+                    }
+                )
+                return True, "portfolio_target_hit", meta
+    finally:
+        cur.close()
+
+    # --- Check 2: new high-quality NOW setups vs previous session ---
+    if session_no is not None and session_no > 0:
+        now_rows = _fetch_buy_setups_for_session(conn, target_date, session_no, "NOW")
+        now_syms = _setup_symbols(now_rows)
+        prev_syms: set[str] = set()
+        if session_no > 1:
+            prev_rows = _fetch_buy_setups_for_session(conn, target_date, session_no - 1, "NOW")
+            prev_syms = _setup_symbols(prev_rows)
+        truly_new = [s for s in sorted(now_syms) if s not in prev_syms]
+        if truly_new:
+            meta["new_setup_symbols"] = truly_new
+            meta["now_setups"] = now_rows
+            return True, "new_trade_setup", meta
+
+    # --- Check 3: WATCH -> NOW confirmation ---
+    if session_no is not None and session_no > 1:
+        prev_watch = _fetch_buy_setups_for_session(conn, target_date, session_no - 1, "WATCH")
+        watch_syms = _setup_symbols(prev_watch)
+        now_rows2 = _fetch_buy_setups_for_session(conn, target_date, session_no, "NOW")
+        now_syms2 = _setup_symbols(now_rows2)
+        confirmed = sorted(watch_syms & now_syms2)
+        if confirmed:
+            meta["confirmed_symbols"] = confirmed
+            meta["now_setups"] = now_rows2
+            return True, "setup_confirmed", meta
+
+    # --- Check 4: significant DSEX move since last delivered pulse ---
+    mc = market_context or {}
+    cur_chg = mc.get("dsex_change_pct")
+    try:
+        cur_f = float(cur_chg) if cur_chg is not None else None
+    except (TypeError, ValueError):
+        cur_f = None
+    if cur_f is not None:
+        cur2 = conn.cursor()
+        try:
+            cur2.execute(
+                """
+                SELECT deepseek_input
+                FROM pulse_log
+                WHERE trader_id = %s AND telegram_sent = TRUE
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (trader_id,),
             )
-    lines.append("")
-    buy_count = int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or []))
-    watch_count = int(analysis.get("watch_signal_total") or len(analysis.get("watch_signals") or []))
-    exit_count = len(analysis.get("exit_signals") or [])
-    total_a = analysis.get("total_analysed", 0)
-    lines.append("Market class breakdown:")
-    lines.append(f"BUY signals: {buy_count} | WATCH: {watch_count} | EXIT: {exit_count}")
-    lines.append(f"Stocks analysed: {total_a}")
-    lines.append(f"(trader_id={trader_id})")
+            row = cur2.fetchone()
+        finally:
+            cur2.close()
+        prev_snap = None
+        if row and row[0] is not None:
+            inp = row[0]
+            if isinstance(inp, str):
+                try:
+                    inp = json.loads(inp)
+                except json.JSONDecodeError:
+                    inp = {}
+            if isinstance(inp, dict):
+                prev_snap = inp.get("market_snapshot") or {}
+        prev_chg = prev_snap.get("dsex_change_pct") if isinstance(prev_snap, dict) else None
+        try:
+            prev_f = float(prev_chg) if prev_chg is not None else None
+        except (TypeError, ValueError):
+            prev_f = None
+        if prev_f is None:
+            if abs(cur_f) > 1.5:
+                meta["dsex_change_pct"] = cur_f
+                return True, "market_significant_move", meta
+        elif abs(cur_f - prev_f) > 1.5:
+            meta["dsex_change_pct"] = cur_f
+            meta["prev_dsex_change_pct"] = prev_f
+            return True, "market_significant_move", meta
 
-    # Inject scorecard and accuracy context
-    if scorecard:
-        sc = scorecard
-        lines.append("")
-        lines.append("NexTrade performance scorecard:")
-        if sc.get("win_rate") is None:
-            lines.append(sc.get("message") or "Building accuracy baseline — insufficient data")
-        else:
+    # --- Check 5: first session of the day ---
+    if session_no == 1:
+        return True, "first_session", meta
+
+    return False, "nothing_actionable", meta
+
+
+def build_proactive_pulse(
+    analysis_summary: dict,
+    portfolio: list,
+    market_context: dict,
+    session_no: int,
+    send_reason: str,
+    target_date: date,
+    conn,
+    meta: dict | None = None,
+) -> tuple[str, str]:
+    """Build system + user message for DeepSeek focused on the pulse trigger."""
+    meta = meta or {}
+    system_prompt = SYSTEM_PROMPT.strip()
+    if session_no == 0:
+        system_prompt = system_prompt + "\n\n" + EOD_INSTRUCTIONS.strip()
+
+    dsex = _float_or_none(market_context.get("dsex_index"))
+    dsex_ch = _float_or_none(market_context.get("dsex_change_pct"))
+    dsex_str = f"{dsex:.2f}" if dsex is not None else "n/a"
+    ch_str = f"{dsex_ch:+.1f}%" if dsex_ch is not None else "n/a"
+
+    def _fmt_setup_block(rows: list[dict]) -> str:
+        lines: list[str] = []
+        for r in rows:
+            sym = r.get("symbol")
+            s = r.get("setup") or {}
+            if not isinstance(s, dict):
+                continue
             lines.append(
-                f"Win rate: {sc['win_rate']}% "
-                f"({sc.get('wins', 0)} wins / {sc.get('losses', 0)} losses, unresolved {sc.get('unresolved', 0)}) "
-                f"| Sample size: {sc.get('sample_size', 0)}"
+                f"{sym} — {s.get('setup_type', '')}\n"
+                f"Current price: {s.get('current_price', '')}\n"
+                f"ENTRY: {s.get('entry', '')} (zone: {s.get('entry_zone', ['',''])[0]}-{s.get('entry_zone', ['',''])[1]})\n"
+                f"TARGET 1: {s.get('target_1', '')} (+{s.get('pct_to_target_1', '')}%) — sell 50% here\n"
+                f"TARGET 2: {s.get('target_2', '')} (+{s.get('pct_to_target_2', '')}%) — sell rest here\n"
+                f"STOP LOSS: {s.get('stop_loss', '')} ({s.get('pct_to_stop', '')}%) — hard stop\n"
+                f"RISK/REWARD: 1:{s.get('rr_1', '')}\n"
+                f"WHY: {', '.join(s.get('reasons') or [])}\n"
             )
-            lines.append(f"Avg P&L on resolved: {sc.get('avg_pnl_on_resolved', 0):+.2f}%")
-        if sc.get("top_wins"):
-            lines.append("Recent wins:")
-            for w in sc["top_wins"][:3]:
-                lines.append(
-                    f"✅ {w.get('symbol')} {w.get('signal_type', '')} @ {w.get('price_at_signal')} "
-                    f"→ {w.get('price_at_eval')} ({(w.get('pnl_pct') or 0):+.1f}%)"
-                )
-        losses_key = sc.get("recent_losses") or sc.get("top_losses") or []
-        if losses_key:
-            lines.append("Recent losses:")
-            for l in losses_key[:3]:
-                lines.append(
-                    f"❌ {l.get('symbol')} {l.get('signal_type', '')} @ {l.get('price_at_signal')} "
-                    f"→ {l.get('price_at_eval')} ({(l.get('pnl_pct') or 0):+.1f}%)"
-                )
-    if accuracy_context:
-        lines.append("")
-        lines.append(accuracy_context)
+        return "\n".join(lines).strip()
 
-    dw = (data_warning or "").strip()
-    if dw:
-        lines.append("")
-        lines.append(dw)
+    def _portfolio_lines() -> str:
+        lines = []
+        for p in portfolio or []:
+            lines.append(
+                f"- {p.get('symbol')}: qty {p.get('quantity')} @ {p.get('avg_buy_price')} | "
+                f"now {p.get('current_price')} | P&L {float(p.get('pnl_pct') or 0):+.1f}%"
+            )
+        return "\n".join(lines) if lines else "(no open positions)"
 
-    return effective_system, "\n".join(lines)
+    now_rows = meta.get("now_setups")
+    if not isinstance(now_rows, list) or not now_rows:
+        now_rows = _fetch_buy_setups_for_session(conn, target_date, session_no, "NOW")
+    watch_rows = _fetch_buy_setups_for_session(conn, target_date, session_no, "WATCH")
+
+    user_msg = ""
+
+    if send_reason in ("new_trade_setup", "setup_confirmed"):
+        user_msg = (
+            f"TRADE ALERT — Session {session_no}\n"
+            f"Date: {target_date.isoformat()}\n"
+            f"DSEX: {dsex_str} ({ch_str})\n\n"
+            f"NEW SETUP(S) CONFIRMED:\n"
+            f"{_fmt_setup_block(now_rows)}\n\n"
+            f"TRADER PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"WATCH LIST (forming setups):\n{_fmt_setup_block(watch_rows)}\n"
+        )
+
+    elif send_reason == "portfolio_stop_loss_alert":
+        sym = meta.get("symbol", "")
+        user_msg = (
+            f"POSITION ALERT — {sym}\n\n"
+            f"{sym} approaching your stop loss.\n"
+            f"Current: {meta.get('current_price', '')} | Your stop: {meta.get('stop_price', '')}\n"
+            f"You are down {float(meta.get('pnl_pct') or 0):.1f}% on this position.\n\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"Action required: Review {sym} immediately.\n"
+        )
+
+    elif send_reason == "portfolio_target_hit":
+        sym = meta.get("symbol", "")
+        user_msg = (
+            f"TARGET HIT — {sym}\n\n"
+            f"{sym} reached {meta.get('target_price', '')}.\n"
+            f"You are up {float(meta.get('pnl_pct') or 0):.1f}% on this position.\n\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"Consider: Take partial or full profit.\n"
+        )
+
+    elif send_reason == "portfolio_exit_signal":
+        sym = meta.get("symbol", "")
+        user_msg = (
+            f"EXIT SIGNAL — {sym}\n\n"
+            f"Latest model signal for {sym} is EXIT.\n\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"Action required: Decide whether to exit {sym} now.\n"
+        )
+
+    elif send_reason == "market_significant_move":
+        direction = "up" if (dsex_ch or 0) >= 0 else "down"
+        user_msg = (
+            f"MARKET MOVE ALERT\n\n"
+            f"DSEX {direction} {abs(dsex_ch or 0):.1f}% (session context).\n"
+            f"Impact on your portfolio:\n{_portfolio_lines()}\n\n"
+            f"Active setups (NOW):\n{_fmt_setup_block(now_rows)}\n"
+        )
+
+    elif send_reason == "first_session":
+        prev_dsex = None
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT dsex_index FROM market_summary
+                WHERE trade_date < %s
+                ORDER BY trade_date DESC
+                LIMIT 1
+                """,
+                (target_date,),
+            )
+            pr = cur.fetchone()
+            if pr:
+                prev_dsex = _float_or_none(pr[0])
+        finally:
+            cur.close()
+        prev_s = f"{prev_dsex:.2f}" if prev_dsex is not None else "n/a"
+        user_msg = (
+            f"MARKET OPEN — Session 1\n"
+            f"DSEX: {dsex_str} | Yesterday close: {prev_s}\n\n"
+            f"ACTIVE SETUPS TODAY:\n"
+            f"NOW:\n{_fmt_setup_block(now_rows)}\n\n"
+            f"WATCH:\n{_fmt_setup_block(watch_rows)}\n\n"
+            f"YOUR PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"Focus for today: prioritise risk, then highest conviction NOW setups.\n"
+        )
+
+    else:
+        user_msg = (
+            f"SESSION {session_no} — {target_date.isoformat()}\n"
+            f"DSEX {dsex_str} ({ch_str})\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n"
+        )
+
+    return system_prompt, user_msg
+
+
 
 
 def call_deepseek(system_message: str, user_message: str, temperature: float = 0.3) -> str:
@@ -1385,63 +1407,72 @@ def format_telegram_message(
     portfolio: list,
     target_date: date,
     session_no: int = 0,
-    pulse_type: str = "eod",
-    scorecard: dict | None = None,
+    send_reason: str = "nothing_actionable",
+    **kwargs: Any,
 ) -> str:
-    buy_count = int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or []))
-    watch_count = int(analysis.get("watch_signal_total") or len(analysis.get("watch_signals") or []))
-    exit_count = len(analysis.get("exit_signals") or [])
-    total_a = analysis.get("total_analysed", 0)
+    """Wrap DeepSeek plain-text body in Telegram HTML header/footer."""
+    _ = analysis, portfolio
+    pulse_type = kwargs.pop("pulse_type", None)
+    kwargs.pop("scorecard", None)
+    kwargs.pop("proactive_now_count", None)
 
-    body = _plain_text_for_telegram_body(deepseek_response or "")
-    session_label = get_session_label(session_no)
-    header = f"📊 <b>NexTrade {session_label}</b>"
+    body_raw = _plain_text_for_telegram_body(deepseek_response or "")
+    body_esc = html.escape(body_raw)
+
+    day_str = target_date.strftime("%a %d %b")
     if session_no == -1:
-        subheader = f"📅 {target_date.strftime('%a %d %b')} | Market opens at 10:00am"
-    elif 1 <= session_no <= 10:
-        subheader = f"📅 {target_date.strftime('%d %b')} | Live market update"
+        session_str = "Pre-Market"
     elif session_no == 0:
-        subheader = f"📅 {target_date.strftime('%a %d %b')} | Market closed"
+        session_str = "End of Day"
     else:
-        subheader = f"📅 {target_date.strftime('%a %d %b')} | Market update"
-    header = f"{header}\n{subheader}"
+        session_str = f"Session {session_no} of 10"
 
-    # NexTrade accuracy scorecard section
-    sc = scorecard or {}
-    if sc.get("total_evaluated", 0) > 0:
-        scorecard_section = (
-            "\n━━━━━━━━━━━━━━━━━━\n"
-            "📈 <b>NexTrade Scorecard</b> (last 7 days)\n"
-            f"Win rate: <b>{sc['win_rate']:.0f}%</b> | "
-            f"{sc['wins']}W {sc['losses']}L {sc['neutrals']}N\n"
-            f"Avg P&amp;L: <b>{sc['avg_pnl_pct']:+.1f}%</b> per signal\n"
+    headers = {
+        "new_trade_setup": "🚨 NexTrade — Live Trade Alert",
+        "setup_confirmed": "⚡ NexTrade — Setup Confirmed",
+        "portfolio_stop_loss_alert": "⚠️ NexTrade — Position Alert",
+        "portfolio_target_hit": "💰 NexTrade — Target Hit",
+        "market_significant_move": "📊 NexTrade — Market Alert",
+        "first_session": "🔔 NexTrade — Market Open",
+        "portfolio_exit_signal": "🚨 NexTrade — Exit Alert",
+        "nothing_actionable": "📊 NexTrade — Market Pulse",
+    }
+    header_title = headers.get(send_reason, "📊 NexTrade — Market Update")
+
+    if pulse_type == "premarket":
+        head_block = (
+            f"<b>🌅 NexTrade — Pre-Market Brief</b>\n"
+            f"📅 {day_str} · Market opens at 10:00am"
         )
-        if sc.get("top_wins"):
-            scorecard_section += "\nTop wins:\n"
-            for w in sc["top_wins"][:2]:
-                scorecard_section += f"- {w['symbol']}: {w['pnl_pct']:+.1f}%\n"
-        if sc.get("top_losses"):
-            scorecard_section += "\nRecent losses:\n"
-            for l in sc["top_losses"][:2]:
-                scorecard_section += f"- {l['symbol']}: {l['pnl_pct']:+.1f}%\n"
+    elif pulse_type == "eod":
+        head_block = (
+            f"<b>🌙 NexTrade — End of Day</b>\n"
+            f"📅 {day_str} · Market closed"
+        )
     else:
-        scorecard_section = (
-            "\n━━━━━━━━━━━━━━━━━━\n"
-            "📈 <b>NexTrade Scorecard</b>\n"
-            "Building accuracy baseline — first week of live signals.\n"
+        head_block = (
+            f"<b>{html.escape(header_title)}</b>\n"
+            f"📅 {day_str} · {session_str}"
         )
 
-    score_title = "Yesterday's signals" if session_no == -1 else "Signals today"
-    score = (
-        f"{scorecard_section}"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{score_title}</b>\n"
-        f"Buy: {buy_count} | Watch: {watch_count} | Exit: {exit_count}\n"
-        f"Stocks analysed: {total_a}\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Powered by NexTrade</i>"
+    message = (
+        f"{head_block}\n\n{body_esc}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>🤖 Powered by NexTrade</i>"
     )
-    return f"{header}\n\n{body}{score}"
+
+    if len(message) > 4000:
+        cutoff = message[:3900].rfind("\n")
+        if cutoff < 1:
+            cutoff = 3900
+        message = message[:cutoff]
+        message += (
+            "\n\n<i>Message trimmed. "
+            "Full details in next update.</i>\n"
+            "<i>🤖 Powered by NexTrade</i>"
+        )
+
+    return message
 
 
 def _current_session_no_dhaka() -> int:
@@ -1604,39 +1635,47 @@ def generate_pulse(trader_id: int) -> dict:
             }
 
         analysis = get_analysis_summary(conn, target_date)
-        # Always use actual today for market context, regardless of analysis fallback date
-        analysis["market_context"] = get_market_context(conn, actual_today)
-        # Fetch market trend for prompt injection
+        analysis["market_context"] = enrich_market_context_pulse(
+            conn, actual_today, get_market_context(conn, actual_today)
+        )
         try:
             from analysis.engine import detect_market_trend
             analysis["market_trend"] = detect_market_trend(conn)
         except Exception:
             analysis["market_trend"] = {}
-        if (analysis.get("total_analysed") or 0) == 0:
-            skip = {"status": "skipped", "reason": "no analysis data for today"}
+
+        portfolio = get_trader_portfolio(conn, trader_id)
+
+        should_send, send_reason, meta = should_send_pulse(
+            conn,
+            trader_id,
+            target_date,
+            session_no,
+            analysis,
+            portfolio,
+            analysis.get("market_context") or {},
+        )
+
+        if not should_send:
+            skip = {
+                "status": "skipped",
+                "reason": "nothing_actionable",
+                "detail": send_reason,
+                "session_no": session_no,
+                "trader_id": trader_id,
+            }
             try:
                 _insert_pulse_log(conn, trader_id, target_date, session_no, skip, json.dumps(skip))
             except Exception:
                 pass
-            return skip
+            return {
+                "status": "skipped",
+                "reason": "nothing_actionable",
+                "session_no": session_no,
+                "trader_id": trader_id,
+            }
 
-        portfolio = get_trader_portfolio(conn, trader_id)
-        watchlist = get_trader_watchlist(conn, trader_id)
-
-        # Trader personalisation
-        preferences: dict = {}
-        stock_intents: list = []
-        trader_context: str = ""
-        try:
-            preferences = get_trader_preferences(conn, trader_id)
-            stock_intents = get_trader_stock_intents(conn, trader_id)
-            trader_context = build_trader_context(preferences, stock_intents)
-        except Exception as pref_err:
-            logger.warning("Preferences fetch error (non-fatal): %s", pref_err)
-
-        # Run signal evaluation and fetch scorecard / accuracy context
         scorecard: dict = {}
-        accuracy_context: str = ""
         try:
             from analysis.evaluator import (
                 evaluate_past_signals,
@@ -1644,20 +1683,33 @@ def generate_pulse(trader_id: int) -> dict:
             )
             evaluate_past_signals(days_back=7)
             scorecard = get_scorecard_data(conn, trader_id)
-            accuracy_context = get_accuracy_context_for_deepseek()
+            _ = get_accuracy_context_for_deepseek()
         except Exception as ev_err:
             logger.warning("Evaluator error (non-fatal): %s", ev_err)
 
-        system_msg, user_msg = build_pulse_prompt(
-            analysis, portfolio, watchlist, trader_id, target_date,
-            scorecard=scorecard, accuracy_context=accuracy_context,
-            trader_context=trader_context,
-            preferences=preferences, stock_intents=stock_intents,
-            data_warning=data_warning,
-            conn=conn,
-            session_no=session_no,
+        system_msg, user_msg = build_proactive_pulse(
+            analysis,
+            portfolio,
+            analysis.get("market_context") or {},
+            session_no,
+            send_reason,
+            target_date,
+            conn,
+            meta=meta,
         )
-        deepseek_input = {"system": system_msg, "user": user_msg}
+        mc = analysis.get("market_context") or {}
+        market_snapshot = {
+            "dsex_change_pct": mc.get("dsex_change_pct"),
+            "dsex_index": mc.get("dsex_index"),
+        }
+        deepseek_input = {
+            "system": system_msg,
+            "user": user_msg,
+            "proactive_reason": send_reason,
+            "market_snapshot": market_snapshot,
+        }
+
+        n_now = len(_fetch_buy_setups_for_session(conn, target_date, session_no, "NOW"))
 
         try:
             deepseek_output = call_deepseek(system_msg, user_msg)
@@ -1668,9 +1720,9 @@ def generate_pulse(trader_id: int) -> dict:
                 analysis,
                 portfolio,
                 target_date,
-                session_no=session_no,
-                pulse_type=pulse_type,
-                scorecard=scorecard,
+                session_no,
+                send_reason,
+                pulse_type=("eod" if pulse_type == "eod" else None),
             )
             try:
                 _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -1682,6 +1734,7 @@ def generate_pulse(trader_id: int) -> dict:
                 "trader_id": trader_id,
                 "pulse_date": target_date.isoformat(),
                 "telegram_message": telegram_message,
+                "send_reason": send_reason,
                 "buy_signals": int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or [])),
                 "watch_signals": int(analysis.get("watch_signal_total") or len(analysis.get("watch_signals") or [])),
                 "exit_signals": len(analysis.get("exit_signals") or []),
@@ -1693,9 +1746,9 @@ def generate_pulse(trader_id: int) -> dict:
             analysis,
             portfolio,
             target_date,
-            session_no=session_no,
-            pulse_type=pulse_type,
-            scorecard=scorecard,
+            session_no,
+            send_reason,
+            pulse_type=("eod" if pulse_type == "eod" else None),
         )
         try:
             _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -1707,6 +1760,7 @@ def generate_pulse(trader_id: int) -> dict:
             "trader_id": trader_id,
             "pulse_date": target_date.isoformat(),
             "telegram_message": telegram_message,
+            "send_reason": send_reason,
             "buy_signals": int(analysis.get("buy_signal_total") or len(analysis.get("buy_signals") or [])),
             "watch_signals": int(analysis.get("watch_signal_total") or len(analysis.get("watch_signals") or [])),
             "exit_signals": len(analysis.get("exit_signals") or []),
@@ -1930,28 +1984,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
 
         user_msg = "\n".join(lines)
 
-        preferences: dict = {}
-        stock_intents: list = []
-        trader_ctx = ""
-        try:
-            preferences = get_trader_preferences(conn, trader_id)
-            stock_intents = get_trader_stock_intents(conn, trader_id)
-            trader_ctx = build_trader_context(preferences, stock_intents)
-        except Exception as pref_err:
-            logger.warning("Premarket preferences fetch error (non-fatal): %s", pref_err)
-
-        base_system = build_system_prompt(preferences or {})
-        premarket_addon = (
-            "PREMARKET BRIEFING MODE:\n"
-            "- Market opens in 5 minutes; be specific and actionable.\n"
-            "- Plain text in the body; sentence case throughout; max 400 words.\n"
-            "- No HTML tags in the body (no <b> or <i>); symbols in plain text only.\n"
-            "- Focus on: what to watch at open, key levels, risk reminders.\n"
-        )
-        system_msg = base_system
-        if trader_ctx.strip():
-            system_msg += "\n\n" + trader_ctx.strip() + "\n"
-        system_msg += "\n\n" + premarket_addon
+        system_msg = SYSTEM_PROMPT.strip() + "\n\n" + PREMARKET_INSTRUCTIONS.strip()
 
         deepseek_input = {"system": system_msg, "user": user_msg}
 
@@ -1972,9 +2005,9 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             premarket_analysis,
             portfolio,
             target_date,
-            session_no=session_no,
+            session_no,
+            send_reason="nothing_actionable",
             pulse_type="premarket",
-            scorecard=None,
         )
 
         try:
