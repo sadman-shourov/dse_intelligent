@@ -1471,7 +1471,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _plain_text_for_telegram_body(model_text: str) -> str:
-    """Strip HTML-like tags the model may emit; body is then html-escaped for Telegram HTML mode."""
+    """Strip HTML-like tags the model may emit before the body is inserted into the message."""
     if not model_text:
         return ""
     t = _TAG_RE.sub("", model_text)
@@ -1505,7 +1505,9 @@ def format_telegram_message(
     kwargs.pop("proactive_now_count", None)
 
     body_raw = _plain_text_for_telegram_body(deepseek_response or "")
-    body_esc = html.escape(body_raw)
+    deepseek_response = re.sub(r"\*\*(.*?)\*\*", r"\1", body_raw)
+    deepseek_response = re.sub(r"\*(.*?)\*", r"\1", deepseek_response)
+    deepseek_response = re.sub(r"__(.*?)__", r"\1", deepseek_response)
 
     day_str = target_date.strftime("%a %d %b")
     if session_no == -1:
@@ -1544,7 +1546,7 @@ def format_telegram_message(
         )
 
     message = (
-        f"{head_block}\n\n{body_esc}\n\n"
+        f"{head_block}\n\n{deepseek_response}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "<i>🤖 Powered by NexTrade</i>"
     )
