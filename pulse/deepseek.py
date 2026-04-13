@@ -1393,7 +1393,7 @@ def format_telegram_message(
     exit_count = len(analysis.get("exit_signals") or [])
     total_a = analysis.get("total_analysed", 0)
 
-    body = html.escape(_plain_text_for_telegram_body(deepseek_response or ""), quote=True)
+    body = _plain_text_for_telegram_body(deepseek_response or "")
     session_label = get_session_label(session_no)
     header = f"📊 <b>NexTrade {session_label}</b>"
     if session_no == -1:
