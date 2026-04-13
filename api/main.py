@@ -23,7 +23,7 @@ from analysis.engine import analyse_all_symbols, analyse_symbol, detect_extreme_
 from analysis.evaluator import evaluate_past_signals, get_recent_scorecard, calculate_accuracy_scores
 from pulse.deepseek import generate_pulse, generate_premarket_briefing
 from api.health import check_data_freshness
-from pulse.telegram import deliver_pulse, deliver_premarket_briefing, send_telegram_message, deliver_extreme_move_alerts  # noqa: F401
+from pulse.telegram import deliver_pulse, deliver_premarket_briefing, send_telegram_message, deliver_extreme_move_alerts, deliver_pulse_if_needed  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -204,9 +204,55 @@ def ingest_live_ticks_endpoint():
     if result.get("status") == "error":
         return JSONResponse(status_code=500, content=result)
 
+    analysis_result: dict | None = None
+    delivery_results: dict[str, Any] = {
+        "traders_delivered": 0,
+        "traders_skipped": 0,
+    }
+
     if result.get("status") == "ok":
         mkt_result = fetch_market_summary()
         result["market_summary_updated"] = mkt_result.get("status")
+        try:
+            analysis_result = analyse_all_symbols()
+        except Exception as e:
+            logger.exception("analyse_all_symbols after live ticks failed")
+            analysis_result = {"status": "error", "message": str(e)}
+        try:
+            delivery_results = deliver_pulse_if_needed()
+        except Exception as e:
+            logger.exception("deliver_pulse_if_needed failed")
+            delivery_results = {
+                "status": "error",
+                "message": str(e),
+                "traders_delivered": 0,
+                "traders_skipped": 0,
+            }
+    elif result.get("status") == "skipped":
+        try:
+            delivery_results = deliver_pulse_if_needed()
+        except Exception as e:
+            logger.exception("deliver_pulse_if_needed (skipped ingest) failed")
+            delivery_results = {
+                "status": "error",
+                "message": str(e),
+                "traders_delivered": 0,
+                "traders_skipped": 0,
+            }
+
+    if isinstance(analysis_result, dict) and analysis_result.get("status") == "ok":
+        result["analysis"] = {
+            "buy_signals": analysis_result.get("buy_signals", 0),
+            "watch_signals": analysis_result.get("watch_signals", 0),
+            "exit_signals": analysis_result.get("exit_signals", 0),
+        }
+    elif analysis_result is not None:
+        result["analysis"] = {"status": analysis_result.get("status"), "message": analysis_result.get("message")}
+
+    result["pulses_sent"] = int(delivery_results.get("traders_delivered") or 0)
+    result["pulses_skipped"] = int(delivery_results.get("traders_skipped") or 0)
+    if delivery_results.get("status") == "error":
+        result["pulse_delivery_error"] = delivery_results.get("message")
 
     # Check for extreme moves after successful ingest
     conn = None
@@ -929,7 +975,18 @@ def get_portfolio(trader_id: int):
         # Open holdings
         cur.execute(
             """
-            SELECT symbol, quantity, avg_buy_price, total_invested
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'portfolio_holdings'
+            """
+        )
+        ph_cols = {r[0] for r in cur.fetchall()}
+        extra_cols = ""
+        if "target_price" in ph_cols:
+            extra_cols += ", target_price"
+
+        cur.execute(
+            f"""
+            SELECT symbol, quantity, avg_buy_price, total_invested{extra_cols}
             FROM portfolio_holdings
             WHERE trader_id = %s AND is_open = TRUE
             """,
@@ -942,10 +999,16 @@ def get_portfolio(trader_id: int):
         total_current_value = 0.0
         urgent_exits = 0
 
-        for sym, qty, avg_px, invested in holdings:
+        for row in holdings:
+            if "target_price" in ph_cols:
+                sym, qty, avg_px, invested, tgt_px = row[0], row[1], row[2], row[3], row[4]
+            else:
+                sym, qty, avg_px, invested = row[0], row[1], row[2], row[3]
+                tgt_px = None
             qty = int(qty or 0)
             avg_px = float(avg_px or 0)
             invested = float(invested or 0)
+            tgt_px = _float(tgt_px) if tgt_px is not None else None
 
             # Today's analysis price (live tick in raw_output) with price_history fallback
             cur.execute(
@@ -995,7 +1058,7 @@ def get_portfolio(trader_id: int):
             total_invested += invested
             total_current_value += current_value
 
-            positions.append({
+            pos = {
                 "symbol": sym,
                 "quantity": qty,
                 "avg_buy_price": avg_px,
@@ -1006,7 +1069,10 @@ def get_portfolio(trader_id: int):
                 "pnl_pct": pnl_pct,
                 "signal": signal,
                 "urgent_exit": urgent_exit,
-            })
+            }
+            if "target_price" in ph_cols:
+                pos["target_price"] = tgt_px
+            positions.append(pos)
 
 
         total_pnl = round(total_current_value - total_invested, 2)
@@ -1047,6 +1113,7 @@ async def record_buy(trader_id: int, request: Request):
         quantity = _int(body.get("quantity"))
         price = _float(body.get("price"))
         notes = body.get("notes") or ""
+        target_price = _float(body.get("target_price"))
         trade_date_raw = body.get("date")
 
         if not symbol:
@@ -1125,6 +1192,16 @@ async def record_buy(trader_id: int, request: Request):
                 (trader_id, symbol, new_qty, new_avg, new_total, trade_date, today),
             )
 
+        if target_price is not None and target_price > 0:
+            cur.execute(
+                """
+                UPDATE portfolio_holdings
+                SET target_price = %s, updated_at = NOW()
+                WHERE trader_id = %s AND symbol = %s AND is_open = TRUE
+                """,
+                (target_price, trader_id, symbol),
+            )
+
         cur.close()
         return {
             "status": "ok",
@@ -1135,6 +1212,7 @@ async def record_buy(trader_id: int, request: Request):
             "total_value": total_value,
             "new_avg_price": new_avg,
             "new_quantity": new_qty,
+            "target_price": target_price,
         }
     except Exception as e:
         logger.exception("record_buy error trader_id=%s", trader_id)
@@ -1459,56 +1537,36 @@ async def update_preferences(trader_id: int, request: Request):
     conn = None
     try:
         body = await request.json()
-        trading_style = body.get("trading_style", "")
-        holding_period = body.get("holding_period", "")
-        risk_tolerance = body.get("risk_tolerance", "")
-        strategy_notes = body.get("strategy_notes", "")
-        preferred_signals = body.get("preferred_signals", "")
-        avoid_signals = body.get("avoid_signals", "")
-        notes = body.get("notes", "")
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "JSON object body required"})
 
         conn = _get_conn()
         cur = conn.cursor()
+        cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
+        if not cur.fetchone():
+            cur.close()
+            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+
+        patch = {k: v for k, v in body.items() if v is not None}
+        patch_json = json.dumps(patch, default=str)
 
         cur.execute(
             """
             UPDATE traders
-            SET trading_style = %s, holding_period = %s, risk_tolerance = %s,
-                strategy_notes = %s
-            WHERE id = %s
-            """,
-            (trading_style, holding_period, risk_tolerance, strategy_notes, trader_id),
-        )
-        cur.execute(
-            """
-            INSERT INTO trader_preferences
-                (trader_id, trading_style, holding_period, risk_tolerance,
-                 preferred_signals, avoid_signals, notes, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (trader_id) DO UPDATE SET
-                trading_style = EXCLUDED.trading_style,
-                holding_period = EXCLUDED.holding_period,
-                risk_tolerance = EXCLUDED.risk_tolerance,
-                preferred_signals = EXCLUDED.preferred_signals,
-                avoid_signals = EXCLUDED.avoid_signals,
-                notes = EXCLUDED.notes,
+            SET preferences = COALESCE(preferences, '{}'::jsonb) || %s::jsonb,
                 updated_at = NOW()
+            WHERE id = %s
+            RETURNING preferences
             """,
-            (trader_id, trading_style, holding_period, risk_tolerance,
-             preferred_signals, avoid_signals, notes),
+            (patch_json, trader_id),
         )
+        row = cur.fetchone()
         conn.commit()
+        prefs = row[0] if row and row[0] is not None else {}
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
         cur.close()
-        return _jsonify({
-            "status": "ok",
-            "trader_id": trader_id,
-            "trading_style": trading_style,
-            "holding_period": holding_period,
-            "risk_tolerance": risk_tolerance,
-            "strategy_notes": strategy_notes,
-            "preferred_signals": preferred_signals,
-            "avoid_signals": avoid_signals,
-        })
+        return _jsonify({"status": "ok", "preferences": prefs})
     except Exception as e:
         logger.exception("update_preferences trader_id=%s", trader_id)
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -1525,12 +1583,9 @@ def get_preferences(trader_id: int):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT t.id, t.name, t.trading_style, t.holding_period,
-                   t.risk_tolerance, t.strategy_notes, t.onboarding_complete,
-                   tp.preferred_signals, tp.avoid_signals, tp.notes
-            FROM traders t
-            LEFT JOIN trader_preferences tp ON t.id = tp.trader_id
-            WHERE t.id = %s
+            SELECT COALESCE(preferences, '{}'::jsonb)
+            FROM traders
+            WHERE id = %s
             """,
             (trader_id,),
         )
@@ -1538,18 +1593,10 @@ def get_preferences(trader_id: int):
         cur.close()
         if not row:
             return JSONResponse(status_code=404, content={"error": "Trader not found"})
-        return _jsonify({
-            "trader_id": int(row[0]),
-            "name": row[1] or "",
-            "trading_style": row[2] or "",
-            "holding_period": row[3] or "",
-            "risk_tolerance": row[4] or "",
-            "strategy_notes": row[5] or "",
-            "onboarding_complete": bool(row[6]),
-            "preferred_signals": row[7] or "",
-            "avoid_signals": row[8] or "",
-            "notes": row[9] or "",
-        })
+        prefs = row[0]
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
+        return _jsonify({"status": "ok", "preferences": prefs})
     except Exception as e:
         logger.exception("get_preferences trader_id=%s", trader_id)
         return JSONResponse(status_code=500, content={"error": str(e)})

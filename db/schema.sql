@@ -230,6 +230,8 @@ CREATE TABLE IF NOT EXISTS portfolio_holdings (
     last_updated    DATE NOT NULL,
     is_open         BOOLEAN DEFAULT TRUE,
     notes           TEXT,
+    target_price    NUMERIC(10,2),
+    position_size_bdtt NUMERIC(18,2),
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(trader_id, symbol)
@@ -334,3 +336,10 @@ CREATE TABLE IF NOT EXISTS trader_stock_intents (
 
 CREATE INDEX IF NOT EXISTS idx_stock_intents_trader
     ON trader_stock_intents(trader_id);
+
+-- Portfolio targets & sizing (Neon migrations)
+ALTER TABLE portfolio_holdings ADD COLUMN IF NOT EXISTS target_price NUMERIC(10,2);
+ALTER TABLE portfolio_holdings ADD COLUMN IF NOT EXISTS position_size_bdtt NUMERIC(18,2);
+
+-- Trader JSON preferences (position sizing, filters, etc.)
+ALTER TABLE traders ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'::jsonb;

@@ -1211,6 +1211,60 @@ def should_send_pulse(
     return False, "nothing_actionable", meta
 
 
+def calculate_position_size(
+    entry_price: float,
+    stop_loss: float,
+    portfolio_size: float,
+    risk_pct: float = 2.0,
+) -> dict:
+    risk_amount = portfolio_size * (risk_pct / 100.0)
+    if entry_price <= 0:
+        return {
+            "risk_amount_bdt": round(risk_amount, 0),
+            "max_position_bdt": 0.0,
+            "suggested_shares": 0,
+            "risk_pct": risk_pct,
+        }
+    stop_distance_pct = (entry_price - stop_loss) / entry_price
+    if stop_distance_pct <= 0:
+        return {
+            "risk_amount_bdt": round(risk_amount, 0),
+            "max_position_bdt": 0.0,
+            "suggested_shares": 0,
+            "risk_pct": risk_pct,
+        }
+    max_position_value = risk_amount / stop_distance_pct
+    max_shares = int(max_position_value / entry_price)
+    return {
+        "risk_amount_bdt": round(risk_amount, 0),
+        "max_position_bdt": round(max_position_value, 0),
+        "suggested_shares": max_shares,
+        "risk_pct": risk_pct,
+    }
+
+
+def _load_trader_preferences_json(conn, trader_id: int) -> dict:
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT preferences FROM traders WHERE id = %s", (trader_id,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return {}
+        p = row[0]
+        if isinstance(p, dict):
+            return p
+        if isinstance(p, str):
+            try:
+                return json.loads(p)
+            except json.JSONDecodeError:
+                return {}
+        return {}
+    except Exception:
+        return {}
+    finally:
+        cur.close()
+
+
 def build_proactive_pulse(
     analysis_summary: dict,
     portfolio: list,
@@ -1219,10 +1273,21 @@ def build_proactive_pulse(
     send_reason: str,
     target_date: date,
     conn,
+    trader_id: int,
     meta: dict | None = None,
 ) -> tuple[str, str]:
     """Build system + user message for DeepSeek focused on the pulse trigger."""
     meta = meta or {}
+    prefs = _load_trader_preferences_json(conn, trader_id)
+    try:
+        portfolio_size = float(prefs.get("portfolio_size") or 0)
+    except (TypeError, ValueError):
+        portfolio_size = 0.0
+    try:
+        risk_pct = float(prefs["risk_pct"]) if prefs.get("risk_pct") is not None else 2.0
+    except (TypeError, ValueError, KeyError):
+        risk_pct = 2.0
+
     system_prompt = SYSTEM_PROMPT.strip()
     if session_no == 0:
         system_prompt = system_prompt + "\n\n" + EOD_INSTRUCTIONS.strip()
@@ -1232,14 +1297,14 @@ def build_proactive_pulse(
     dsex_str = f"{dsex:.2f}" if dsex is not None else "n/a"
     ch_str = f"{dsex_ch:+.1f}%" if dsex_ch is not None else "n/a"
 
-    def _fmt_setup_block(rows: list[dict]) -> str:
+    def _fmt_setup_block(rows: list[dict], *, now_sizing: bool = False) -> str:
         lines: list[str] = []
         for r in rows:
             sym = r.get("symbol")
             s = r.get("setup") or {}
             if not isinstance(s, dict):
                 continue
-            lines.append(
+            block = (
                 f"{sym} — {s.get('setup_type', '')}\n"
                 f"Current price: {s.get('current_price', '')}\n"
                 f"ENTRY: {s.get('entry', '')} (zone: {s.get('entry_zone', ['',''])[0]}-{s.get('entry_zone', ['',''])[1]})\n"
@@ -1249,7 +1314,30 @@ def build_proactive_pulse(
                 f"RISK/REWARD: 1:{s.get('rr_1', '')}\n"
                 f"WHY: {', '.join(s.get('reasons') or [])}\n"
             )
+            if now_sizing:
+                entry = _float_or_none(s.get("entry"))
+                stop = _float_or_none(s.get("stop_loss"))
+                if portfolio_size > 0 and entry and stop and entry > 0 and entry > stop:
+                    sizing = calculate_position_size(entry, stop, portfolio_size, risk_pct)
+                    block += (
+                        f"\nPOSITION SIZING (your {risk_pct}% risk rule):\n"
+                        f"Portfolio: {portfolio_size:,.0f} BDT\n"
+                        f"Max risk: {sizing['risk_amount_bdt']:,.0f} BDT\n"
+                        f"Suggested: {sizing['suggested_shares']} shares "
+                        f"({sizing['max_position_bdt']:,.0f} BDT)\n"
+                    )
+                elif portfolio_size > 0:
+                    block += (
+                        "\nPOSITION SIZING: need valid entry/stop to size this trade.\n"
+                    )
+                else:
+                    block += (
+                        "\nSet your portfolio size to get position sizing: "
+                        "reply with your total BDT\n"
+                    )
+            lines.append(block)
         return "\n".join(lines).strip()
+
 
     def _portfolio_lines() -> str:
         lines = []
@@ -1273,9 +1361,9 @@ def build_proactive_pulse(
             f"Date: {target_date.isoformat()}\n"
             f"DSEX: {dsex_str} ({ch_str})\n\n"
             f"NEW SETUP(S) CONFIRMED:\n"
-            f"{_fmt_setup_block(now_rows)}\n\n"
+            f"{_fmt_setup_block(now_rows, now_sizing=True)}\n\n"
             f"TRADER PORTFOLIO:\n{_portfolio_lines()}\n\n"
-            f"WATCH LIST (forming setups):\n{_fmt_setup_block(watch_rows)}\n"
+            f"WATCH LIST (forming setups):\n{_fmt_setup_block(watch_rows, now_sizing=False)}\n"
         )
 
     elif send_reason == "portfolio_stop_loss_alert":
@@ -1314,7 +1402,7 @@ def build_proactive_pulse(
             f"MARKET MOVE ALERT\n\n"
             f"DSEX {direction} {abs(dsex_ch or 0):.1f}% (session context).\n"
             f"Impact on your portfolio:\n{_portfolio_lines()}\n\n"
-            f"Active setups (NOW):\n{_fmt_setup_block(now_rows)}\n"
+            f"Active setups (NOW):\n{_fmt_setup_block(now_rows, now_sizing=True)}\n"
         )
 
     elif send_reason == "first_session":
@@ -1340,8 +1428,8 @@ def build_proactive_pulse(
             f"MARKET OPEN — Session 1\n"
             f"DSEX: {dsex_str} | Yesterday close: {prev_s}\n\n"
             f"ACTIVE SETUPS TODAY:\n"
-            f"NOW:\n{_fmt_setup_block(now_rows)}\n\n"
-            f"WATCH:\n{_fmt_setup_block(watch_rows)}\n\n"
+            f"NOW:\n{_fmt_setup_block(now_rows, now_sizing=True)}\n\n"
+            f"WATCH:\n{_fmt_setup_block(watch_rows, now_sizing=False)}\n\n"
             f"YOUR PORTFOLIO:\n{_portfolio_lines()}\n\n"
             f"Focus for today: prioritise risk, then highest conviction NOW setups.\n"
         )
@@ -1695,6 +1783,7 @@ def generate_pulse(trader_id: int) -> dict:
             send_reason,
             target_date,
             conn,
+            trader_id,
             meta=meta,
         )
         mc = analysis.get("market_context") or {}
