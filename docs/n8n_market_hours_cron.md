@@ -1,48 +1,43 @@
 # n8n — Market Hours Cron chain
 
-Target flow: **Cron → Ingest Live Ticks → Run Analysis → Deliver Pulse**
+Target flow: **Cron → POST `/ingest/live-ticks`**
 
-## 1. After **Ingest Live Ticks**
+That single endpoint:
 
-Add an **IF** node:
+1. Fetches live ticks (or returns `skipped` outside the session window)
+2. Updates market summary when ingest succeeds
+3. Runs full symbol analysis when ingest status is `ok`
+4. For each active trader, runs proactive pulse logic (send only when actionable)
+5. Returns a summary including `analysis`, `pulses_sent`, and `pulses_skipped`
 
-- **Condition**: combine with **OR**
-  - `{{ $json.status }}` **equals** `ok`
-  - **OR** `{{ $json.status }}` **equals** `skipped`
-- **True** → connect to **Run Analysis**
-- **False** → **stop** (do not run analysis; log / notify as needed)
+## 1. n8n workflow
 
-Rationale: only abort when the ingest step reports a hard failure; `skipped` (e.g. market closed) may still be an intentional outcome—adjust if your ingest never returns `skipped` on success paths.
+Use one **HTTP Request** node per session tick:
 
-## 2. After **Run Analysis**
+- **Method**: POST
+- **URL**: `https://<your-api>/ingest/live-ticks` (or local `http://localhost:8000/ingest/live-ticks`)
 
-Add an **IF** node:
+No separate "Run Analysis" or "Deliver Pulse" nodes are required; those steps run inside the endpoint.
 
-- **Condition**: `{{ $json.status }}` **equals** `ok`
-- **True** → connect to **Deliver Pulse**
-- **False** → **stop** (no pulse on failed analysis)
+## 2. Response fields (reference)
 
-### Optional warning (not blocking)
+- `status`: `ok` | `skipped` | `error`
+- `market_summary_updated`: present when ingest was `ok`
+- `analysis`: when analysis ran successfully — `buy_signals`, `watch_signals`, `exit_signals`
+- `pulses_sent` / `pulses_skipped`: proactive Telegram delivery counts
+- `extreme_moves_detected` / `extreme_move_alert`: unchanged from before
 
-If the analysis response includes a symbol count (e.g. `done`):
+When ingest is `skipped` (e.g. market closed), analysis may be omitted, but **`deliver_pulse_if_needed` still runs** so portfolio-level alerts can fire.
 
-- If `done < 300`, append a **warning** (Set node or Code) but **continue** to Deliver Pulse if status is still `ok`.
+## 3. Optional monitoring
 
-## 3. After **Deliver Pulse**
-
-- If `traders_delivered === 0` (or missing and you treat as failure), **log as error** (e.g. Telegram, Slack, or n8n Error Workflow).
-- Do not treat as success for alerting purposes when no traders received the pulse.
+- If `status === "error"`, treat as failure (alert / retry).
+- Low `pulses_sent` is normal when nothing actionable; do not treat as an error by itself.
 
 ## Quick reference (expression mode)
 
-Ingest gate (OR):
+Single step — no IF chain required for analysis/pulse; optional check on HTTP status only:
 
 ```text
-{{ $json.status === "ok" || $json.status === "skipped" }}
-```
-
-Analysis gate:
-
-```text
-{{ $json.status === "ok" }}
+{{ $json.status !== "error" }}
 ```

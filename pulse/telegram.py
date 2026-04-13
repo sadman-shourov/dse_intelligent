@@ -430,6 +430,117 @@ def deliver_pulse(trader_id: int | None = None) -> dict[str, Any]:
         conn.close()
 
 
+def deliver_pulse_if_needed() -> dict[str, Any]:
+    """Generate proactive pulses for active traders and send only when actionable."""
+    load_env()
+    delivered = 0
+    skipped = 0
+    details: list[dict[str, Any]] = []
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        logger.exception("deliver_pulse_if_needed: DB connection failed: %s", e)
+        return {
+            "status": "error",
+            "reason": str(e),
+            "traders_delivered": 0,
+            "traders_skipped": 0,
+            "details": [],
+        }
+
+    conn.autocommit = True
+    try:
+        target_date = get_db_date(conn)
+        traders = get_active_traders(conn)
+        from pulse.deepseek import generate_pulse
+
+        for t in traders:
+            tid = int(t["id"])
+            name = t.get("name") or f"Trader {tid}"
+            chat = str(t.get("telegram_chat_id") or "").strip()
+            if not chat:
+                skipped += 1
+                details.append({"trader_id": tid, "name": name, "status": "skipped", "reason": "no_chat_id"})
+                continue
+
+            try:
+                result = generate_pulse(tid)
+            except Exception as e:
+                logger.exception("generate_pulse failed for trader %s: %s", tid, e)
+                skipped += 1
+                details.append({"trader_id": tid, "name": name, "status": "error", "reason": str(e)})
+                continue
+
+            if result.get("status") == "ok":
+                msg = result.get("telegram_message")
+                if not msg or not str(msg).strip():
+                    skipped += 1
+                    details.append({"trader_id": tid, "name": name, "status": "skipped", "reason": "empty_message"})
+                    continue
+                try:
+                    send_res = send_telegram_message(
+                        chat_id=chat,
+                        message=truncate_telegram_message(str(msg).strip()),
+                    )
+                except Exception as e:
+                    logger.exception("send_telegram_message failed for trader %s: %s", tid, e)
+                    skipped += 1
+                    details.append({"trader_id": tid, "name": name, "status": "error", "reason": str(e)})
+                    continue
+
+                if send_res.get("status") == "ok":
+                    latest = get_latest_pulse(conn, tid, target_date)
+                    pulse_row_id = latest["id"] if latest else None
+                    if pulse_row_id is not None:
+                        mark_pulse_sent(conn, pulse_row_id, int(send_res["message_id"]))
+                    delivered += 1
+                    details.append(
+                        {
+                            "trader_id": tid,
+                            "name": name,
+                            "status": "delivered",
+                            "message_id": send_res.get("message_id"),
+                            "pulse_id": pulse_row_id,
+                        }
+                    )
+                else:
+                    latest = get_latest_pulse(conn, tid, target_date)
+                    pulse_row_id = latest["id"] if latest else None
+                    if pulse_row_id is not None:
+                        try:
+                            mark_pulse_telegram_failed(conn, pulse_row_id)
+                        except Exception:
+                            logger.exception("mark_pulse_telegram_failed failed pulse_id=%s", pulse_row_id)
+                    skipped += 1
+                    details.append(
+                        {
+                            "trader_id": tid,
+                            "name": name,
+                            "status": "failed",
+                            "error": send_res.get("error"),
+                        }
+                    )
+            else:
+                skipped += 1
+                details.append(
+                    {
+                        "trader_id": tid,
+                        "name": name,
+                        "status": result.get("status", "skipped"),
+                        "reason": result.get("reason") or result.get("message"),
+                    }
+                )
+
+        return {
+            "status": "ok",
+            "traders_delivered": delivered,
+            "traders_skipped": skipped,
+            "details": details,
+        }
+    finally:
+        conn.close()
+
+
 def get_already_alerted_today(conn, target_date: date) -> set[str]:
     cur = conn.cursor()
     try:

@@ -1212,6 +1212,245 @@ def determine_overall_signal(
     return signal, round(score / 100.0, 2)
 
 
+def generate_trade_setup(
+    symbol: str,
+    df: pd.DataFrame,
+    sr: dict,
+    breakout: dict,
+    fib: dict,
+    rsi: dict,
+    macd: dict,
+    volume: dict,
+    intraday: dict,
+    rs: dict,
+    stock_class: str,
+    class_flags: dict,
+    market_context: dict,
+    current_price: float,
+    session_no: int | None,
+) -> dict:
+    """
+    Generates a precise trade setup with entry, targets, stop loss and risk/reward.
+    Only returns a valid setup if conditions are met.
+    """
+    _ = symbol  # reserved for logging / future use
+    class_flags = class_flags or {}
+    intraday = intraday or {}
+    rs = rs or {}
+    market_context = market_context or {}
+
+    rsi_val = rsi.get("rsi")
+    try:
+        rsi_f = float(rsi_val) if rsi_val is not None else None
+    except (TypeError, ValueError):
+        rsi_f = None
+
+    setup_type: str | None = None
+
+    # Step 1 — Detect setup type
+    if (
+        bool(breakout.get("breakout"))
+        and bool(breakout.get("volume_confirmed"))
+        and rsi_f is not None
+        and 40 <= rsi_f <= 75
+        and stock_class != "GAMBLING"
+        and not class_flags.get("suspected_z_category")
+        and current_price > 0
+    ):
+        setup_type = "BREAKOUT"
+
+    supports = sr.get("support") or []
+    lowest_support = min(supports) if supports else None
+    if setup_type is None and supports and lowest_support and rsi_f is not None and stock_class != "GAMBLING":
+        try:
+            ls = float(lowest_support)
+            if ls > 0 and current_price >= ls and (current_price - ls) / ls <= 0.02:
+                if rsi_f < 42:
+                    tail5 = df["close"].astype(float).tail(5)
+                    if len(tail5) >= 2 and not tail5.is_monotonic_decreasing:
+                        setup_type = "SUPPORT_BOUNCE"
+        except (TypeError, ValueError):
+            pass
+
+    if setup_type is None and rsi_f is not None:
+        if (
+            rsi_f < 32
+            and macd.get("signal") == "bullish_crossover"
+            and stock_class in ("TRADING", "INVESTMENT")
+            and volume.get("signal") in ("normal", "high")
+        ):
+            setup_type = "OVERSOLD_REVERSAL"
+
+    if setup_type is None and rsi_f is not None:
+        closes = df["close"].astype(float)
+        if len(closes) >= 6:
+            last3 = closes.tail(3).values
+            prev3 = closes.iloc[-6:-3].values
+            step_up = all(last3[i] > prev3[i] for i in range(3))
+            if (
+                step_up
+                and 50 <= rsi_f <= 68
+                and volume.get("signal") == "high"
+                and intraday.get("momentum") in ("strong_bullish", "weak_bullish")
+                and rs.get("rs_signal") in ("outperform", "strong_outperform")
+            ):
+                setup_type = "MOMENTUM_CONTINUATION"
+
+    if setup_type is None:
+        return {"has_setup": False}
+
+    resistance_levels = list(sr.get("resistance") or [])
+    fib_levels = fib.get("levels") or {}
+    if not isinstance(fib_levels, dict):
+        fib_levels = {}
+
+    def _fib_float(key: str) -> float | None:
+        v = fib_levels.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    entry: float
+    entry_zone: list[float]
+    support: float | None = None
+
+    if setup_type == "BREAKOUT":
+        entry = float(current_price)
+        entry_zone = [current_price * 0.99, current_price * 1.005]
+
+    elif setup_type == "SUPPORT_BOUNCE":
+        support_list = sr.get("support") or []
+        support = float(support_list[0]) if support_list else None
+        if not support:
+            return {"has_setup": False}
+        entry = support * 1.005
+        entry_zone = [support * 0.995, support * 1.01]
+
+    elif setup_type == "OVERSOLD_REVERSAL":
+        entry = float(current_price)
+        entry_zone = [current_price * 0.995, current_price * 1.01]
+
+    else:  # MOMENTUM_CONTINUATION
+        entry = float(current_price) * 0.99
+        entry_zone = [current_price * 0.985, current_price * 0.995]
+
+    target_1: float
+    if resistance_levels:
+        target_1 = float(resistance_levels[0])
+    else:
+        target_1 = entry * 1.07
+
+    target_2: float
+    if len(resistance_levels) >= 2:
+        target_2 = float(resistance_levels[1])
+    else:
+        target_2 = entry * 1.15
+
+    # Fib refinements: only override if level lies strictly between entry and cap resistance
+    cap_r = float(resistance_levels[0]) if resistance_levels else None
+    near_tol = 0.015
+    cp = float(current_price)
+    l618 = _fib_float("61.8")
+    l382 = _fib_float("38.2")
+    l50 = _fib_float("50")
+    l236 = _fib_float("23.6")
+    fib_candidate: float | None = None
+    if l618 and cp > 0 and abs(cp - l618) / l618 <= near_tol and l382:
+        fib_candidate = l382
+    elif l50 and cp > 0 and abs(cp - l50) / l50 <= near_tol and l236:
+        fib_candidate = l236
+    if fib_candidate and fib_candidate > entry:
+        if cap_r is None:
+            target_1 = fib_candidate
+        elif entry < fib_candidate < cap_r:
+            target_1 = fib_candidate
+
+    # Step 5 — Stop loss
+    if setup_type == "BREAKOUT":
+        stop_loss = entry * 0.92
+    elif setup_type == "SUPPORT_BOUNCE" and support:
+        stop_loss = support * 0.97
+    elif setup_type == "OVERSOLD_REVERSAL":
+        recent_low = float(df["low"].astype(float).tail(5).min())
+        stop_loss = min(recent_low * 0.98, entry * 0.92)
+    else:
+        stop_loss = entry * 0.94
+
+    risk = entry - stop_loss
+    reward_1 = target_1 - entry
+    reward_2 = target_2 - entry
+    rr_1 = reward_1 / risk if risk > 0 else 0.0
+    rr_2 = reward_2 / risk if risk > 0 else 0.0
+
+    if rr_1 < 1.5:
+        return {"has_setup": False}
+
+    if setup_type == "BREAKOUT":
+        urgency = "NOW"
+    elif setup_type == "SUPPORT_BOUNCE":
+        urgency = "NOW" if current_price <= entry_zone[1] else "WATCH"
+    elif setup_type == "OVERSOLD_REVERSAL":
+        urgency = "WATCH"
+    else:
+        urgency = "FORMING"
+
+    reasons: list[str] = []
+    if setup_type == "BREAKOUT":
+        bl = breakout.get("breakout_level")
+        if bl is not None:
+            try:
+                reasons.append(f"Broke {float(bl):.1f} resistance")
+            except (TypeError, ValueError):
+                reasons.append("Broke resistance")
+        avg_v = breakout.get("avg_volume_20d") or 0
+        cur_v = breakout.get("current_volume") or 0
+        try:
+            if float(avg_v) > 0:
+                reasons.append(f"Volume {float(cur_v) / float(avg_v):.1f}x average")
+        except (TypeError, ValueError):
+            pass
+    if rsi_f is not None and rsi_f < 40:
+        reasons.append(f"RSI {rsi_f:.0f} — not overbought, room to run")
+    if rs.get("available") and rs.get("rs_signal") in ("outperform", "strong_outperform"):
+        rs_val = rs.get("relative_strength") or 0.0
+        try:
+            reasons.append(f"Outperforming DSEX by {float(rs_val):.1f}%")
+        except (TypeError, ValueError):
+            reasons.append("Outperforming DSEX")
+    if macd.get("signal") == "bullish_crossover":
+        reasons.append("MACD bullish crossover")
+    if intraday.get("momentum") == "strong_bullish":
+        reasons.append("Strong intraday uptrend")
+    dsex_chg = market_context.get("dsex_change_pct")
+    try:
+        if dsex_chg is not None and float(dsex_chg) > 0.5:
+            reasons.append(f"Market supportive (DSEX +{float(dsex_chg):.1f}%)")
+    except (TypeError, ValueError):
+        pass
+
+    reasons = reasons[:3]
+
+    return {
+        "has_setup": True,
+        "setup_type": setup_type,
+        "urgency": urgency,
+        "entry": round(entry, 2),
+        "entry_zone": [round(entry_zone[0], 2), round(entry_zone[1], 2)],
+        "target_1": round(target_1, 2),
+        "target_2": round(target_2, 2),
+        "stop_loss": round(stop_loss, 2),
+        "rr_1": round(rr_1, 2),
+        "rr_2": round(rr_2, 2),
+        "pct_to_target_1": round((target_1 - entry) / entry * 100, 1) if entry else 0.0,
+        "pct_to_target_2": round((target_2 - entry) / entry * 100, 1) if entry else 0.0,
+        "pct_to_stop": round((stop_loss - entry) / entry * 100, 1) if entry else 0.0,
+        "reasons": reasons,
+        "setup_detected_session": session_no,
+        "current_price": round(float(current_price), 2),
+    }
+
+
 def build_signal_reason(
     breakout: dict,
     rsi: dict,
@@ -1442,6 +1681,28 @@ def analyse_symbol(
 
         analysis_date = target_date.isoformat()
         current_price = _current_price(df)
+        mc_for_setup = market_context if market_context is not None else {
+            "today": market_summary,
+            "previous": previous_market_summary,
+        }
+        cp_setup = float(current_price) if current_price is not None else 0.0
+        trade_setup = generate_trade_setup(
+            symbol,
+            df,
+            sr,
+            breakout,
+            fib,
+            rsi,
+            macd,
+            volume,
+            intraday,
+            rs,
+            stock_class,
+            class_flags,
+            mc_for_setup,
+            cp_setup,
+            session_no,
+        )
         reason = build_signal_reason(
             breakout, rsi, macd, volume, sr, current_price, class_flags,
             intraday=intraday, rs=rs,
@@ -1488,6 +1749,7 @@ def analyse_symbol(
                 "volume_profile": volume,
                 "signal_reason": reason,
                 "market_trend": market_trend or {},
+                "trade_setup": trade_setup,
             },
             "signal_reason": reason,
             "price_at_signal": current_price,
@@ -1765,6 +2027,7 @@ def analyse_all_symbols() -> dict:
     failed = 0
     buy_signals = 0
     watch_signals = 0
+    exit_signals = 0
     failed_symbols: dict[str, str] = {}
 
     ok_results: list[dict] = []
@@ -1802,6 +2065,8 @@ def analyse_all_symbols() -> dict:
                         buy_signals += 1
                     if sig == "WATCH":
                         watch_signals += 1
+                    if sig == "EXIT":
+                        exit_signals += 1
                     if sig in ("BUY", "WATCH", "EXIT"):
                         signal_rows.append(
                             {
@@ -1844,6 +2109,7 @@ def analyse_all_symbols() -> dict:
         "failed": failed,
         "buy_signals": buy_signals,
         "watch_signals": watch_signals,
+        "exit_signals": exit_signals,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "elapsed_seconds": round(elapsed, 1),
         "failed_symbols": failed_symbols,
