@@ -791,6 +791,19 @@ Follow these rules when giving advice.
 
 CRITICAL: You must ONLY reference portfolio positions that are explicitly listed in the TRADER PORTFOLIO section below. Never invent, assume, or reference any position not in that list. If the portfolio section shows 0 positions, say the portfolio is empty. If it shows 2 positions, only discuss those 2. Fabricating positions is a serious error.
 
+CRITICAL: Every pulse must open with a FRESH observation specific to THIS session. You are FORBIDDEN from using the same opening sentence as any previous session.
+
+For each session observe:
+- Is DSEX up or down vs yesterday's close?
+- Is volume for this session higher or lower than the previous session?
+- Which sector is leading today?
+- What is the intraday trend so far (up/flat/down)?
+
+Open with ONE of these observations — rotate them.
+Never start two consecutive pulses the same way.
+
+For positions flagged CRITICAL or URGENT, do NOT repeat the same advice from previous sessions. Instead ESCALATE — use stronger language each time. If a position has been flagged 5+ times, the trader is ignoring the advice. Address this directly and firmly.
+
 RESPONSE STRUCTURE:
 1. Market overview (2 sentences, specific levels)
 2. Top 2-3 market opportunities aligned with trader's style
@@ -800,6 +813,303 @@ RESPONSE STRUCTURE:
 """
 
     return prompt
+
+
+def get_top_movers_today(conn, session_no: int, limit: int = 3) -> list[dict]:
+    if conn is None or session_no <= 0:
+        return []
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT symbol, change_pct, overall_signal
+            FROM (
+                SELECT
+                    symbol,
+                    NULLIF(trim(raw_output->'relative_strength'->>'stock_change_pct'), '')::numeric AS change_pct,
+                    overall_signal,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY ABS(NULLIF(trim(raw_output->'relative_strength'->>'stock_change_pct'), '')::numeric) DESC,
+                                 id DESC
+                    ) AS rn
+                FROM analysis_results
+                WHERE analysis_date = CURRENT_DATE
+                  AND session_no = %s
+                  AND NULLIF(trim(raw_output->'relative_strength'->>'stock_change_pct'), '') IS NOT NULL
+            ) q
+            WHERE rn = 1
+            ORDER BY ABS(change_pct) DESC, symbol ASC
+            LIMIT %s
+            """,
+            (session_no, limit),
+        )
+        out = []
+        for sym, chg, sig in cur.fetchall():
+            out.append({
+                "symbol": sym,
+                "change_pct": float(chg) if chg is not None else None,
+                "signal": sig,
+            })
+        return out
+    except Exception:
+        return []
+    finally:
+        cur.close()
+
+
+def get_previous_session_counts(conn, target_date: date, session_no: int) -> dict:
+    if conn is None or session_no <= 1:
+        return {"buy": 0, "watch": 0, "exit": 0}
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT
+                COUNT(CASE WHEN overall_signal = 'BUY' THEN 1 END),
+                COUNT(CASE WHEN overall_signal = 'WATCH' THEN 1 END),
+                COUNT(CASE WHEN overall_signal = 'EXIT' THEN 1 END)
+            FROM analysis_results
+            WHERE analysis_date = %s
+              AND session_no = %s
+            """,
+            (target_date, session_no - 1),
+        )
+        row = cur.fetchone() or (0, 0, 0)
+        return {"buy": int(row[0] or 0), "watch": int(row[1] or 0), "exit": int(row[2] or 0)}
+    except Exception:
+        return {"buy": 0, "watch": 0, "exit": 0}
+    finally:
+        cur.close()
+
+
+def get_position_alert_count(conn, trader_id: int, symbol: str, target_date: date) -> int:
+    if conn is None:
+        return 0
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM analysis_results ar
+            JOIN pulse_log pl ON pl.pulse_date = ar.analysis_date
+            WHERE pl.trader_id = %s
+              AND ar.symbol = %s
+              AND ar.analysis_date = %s
+              AND ar.overall_signal = 'EXIT'
+              AND pl.telegram_sent = TRUE
+            """,
+            (trader_id, symbol, target_date),
+        )
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+    finally:
+        cur.close()
+
+
+def calculate_win_rate(conn, trader_id: int) -> dict:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT s.id, s.symbol, s.price_at_signal, phc.close
+            FROM signals s
+            JOIN (
+                SELECT DISTINCT ON (symbol) symbol, close
+                FROM price_history
+                ORDER BY symbol, date DESC
+            ) phc ON s.symbol = phc.symbol
+            WHERE s.signal_type = 'BUY'
+              AND s.is_active = FALSE
+            ORDER BY s.id DESC
+            """
+        )
+        rows = cur.fetchall()
+
+        wins = losses = neutrals = 0
+        resolved_pnls: list[float] = []
+        for _id, _sym, entry, current in rows:
+            e = _float_or_none(entry)
+            c = _float_or_none(current)
+            if not e or not c:
+                continue
+            pnl = ((c - e) / e) * 100.0
+            if pnl > 2.0:
+                wins += 1
+                resolved_pnls.append(pnl)
+            elif pnl < -2.0:
+                losses += 1
+                resolved_pnls.append(pnl)
+            else:
+                neutrals += 1
+
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM signals
+            WHERE signal_type = 'BUY' AND is_active = TRUE
+            """
+        )
+        unresolved = int((cur.fetchone() or [0])[0] or 0)
+
+        sample_size = wins + losses
+        if sample_size < 10:
+            return {
+                "win_rate": None,
+                "wins": wins,
+                "losses": losses,
+                "unresolved": unresolved,
+                "avg_pnl_on_resolved": round(sum(resolved_pnls) / len(resolved_pnls), 2) if resolved_pnls else 0.0,
+                "sample_size": sample_size,
+                "message": "Building accuracy baseline — insufficient data (<10 resolved signals)",
+                "neutrals": neutrals,
+                "total_evaluated": wins + losses + neutrals,
+            }
+
+        return {
+            "win_rate": round((wins / sample_size) * 100, 1),
+            "wins": wins,
+            "losses": losses,
+            "unresolved": unresolved,
+            "avg_pnl_on_resolved": round(sum(resolved_pnls) / len(resolved_pnls), 2) if resolved_pnls else 0.0,
+            "sample_size": sample_size,
+            "neutrals": neutrals,
+            "total_evaluated": wins + losses + neutrals,
+            "message": "",
+        }
+    finally:
+        cur.close()
+
+
+def get_scorecard_data(conn, trader_id: int) -> dict:
+    base = {
+        "win_rate": None,
+        "wins": 0,
+        "losses": 0,
+        "neutrals": 0,
+        "unresolved": 0,
+        "avg_pnl_on_resolved": 0.0,
+        "sample_size": 0,
+        "message": "Building accuracy baseline — insufficient data (<10 resolved signals)",
+        "top_wins": [],
+        "recent_losses": [],
+        "total_evaluated": 0,
+    }
+
+    wr = calculate_win_rate(conn, trader_id)
+    base.update(wr)
+
+    cur = conn.cursor()
+    try:
+        # Recent realized losses from sells (deterministic order)
+        losses_rows = []
+        try:
+            cur.execute(
+                """
+                SELECT
+                    tt.symbol,
+                    tt.price AS sell_price,
+                    ph.avg_buy_price,
+                    ((tt.price - ph.avg_buy_price) / NULLIF(ph.avg_buy_price, 0) * 100) AS pnl_pct,
+                    tt.transaction_date,
+                    tt.id
+                FROM trade_transactions tt
+                JOIN portfolio_holdings ph ON
+                    tt.trader_id = ph.trader_id AND tt.symbol = ph.symbol
+                WHERE tt.trader_id = %s
+                  AND tt.transaction_type = 'SELL'
+                ORDER BY tt.transaction_date DESC, tt.id DESC
+                LIMIT 5
+                """,
+                (trader_id,),
+            )
+            losses_rows = cur.fetchall()
+        except Exception:
+            losses_rows = []
+
+        if losses_rows:
+            base["recent_losses"] = [
+                {
+                    "symbol": r[0],
+                    "signal_type": "SELL",
+                    "price_at_signal": _float_or_none(r[2]),
+                    "price_at_eval": _float_or_none(r[1]),
+                    "pnl_pct": round(_float_or_none(r[3]) or 0.0, 2),
+                    "transaction_date": r[4].isoformat() if hasattr(r[4], "isoformat") else str(r[4]),
+                }
+                for r in losses_rows
+                if (_float_or_none(r[3]) or 0.0) < 0
+            ]
+        else:
+            cur.execute(
+                """
+                SELECT s.symbol, s.signal_type, s.price_at_signal,
+                       ph_current.close AS current_price,
+                       ((ph_current.close - s.price_at_signal) / NULLIF(s.price_at_signal, 0) * 100) AS pnl_pct,
+                       s.id
+                FROM signals s
+                JOIN (
+                    SELECT DISTINCT ON (symbol) symbol, close
+                    FROM price_history
+                    ORDER BY symbol, date DESC
+                ) ph_current ON s.symbol = ph_current.symbol
+                WHERE s.signal_type = 'BUY'
+                  AND s.is_active = FALSE
+                  AND ((ph_current.close - s.price_at_signal) / NULLIF(s.price_at_signal, 0) * 100) < 0
+                ORDER BY pnl_pct ASC, s.id DESC
+                LIMIT 5
+                """
+            )
+            base["recent_losses"] = [
+                {
+                    "symbol": r[0],
+                    "signal_type": r[1],
+                    "price_at_signal": _float_or_none(r[2]),
+                    "price_at_eval": _float_or_none(r[3]),
+                    "pnl_pct": round(_float_or_none(r[4]) or 0.0, 2),
+                }
+                for r in cur.fetchall()
+            ]
+
+        # Deterministic top wins from inactive BUY signals
+        cur.execute(
+            """
+            SELECT s.symbol, s.signal_type, s.price_at_signal,
+                   ph_current.close AS current_price,
+                   ((ph_current.close - s.price_at_signal) / NULLIF(s.price_at_signal, 0) * 100) AS pnl_pct,
+                   s.id
+            FROM signals s
+            JOIN (
+                SELECT DISTINCT ON (symbol) symbol, close
+                FROM price_history
+                ORDER BY symbol, date DESC
+            ) ph_current ON s.symbol = ph_current.symbol
+            WHERE s.signal_type = 'BUY'
+              AND s.is_active = FALSE
+              AND ((ph_current.close - s.price_at_signal) / NULLIF(s.price_at_signal, 0) * 100) > 0
+            ORDER BY pnl_pct DESC, s.id DESC
+            LIMIT 5
+            """
+        )
+        base["top_wins"] = [
+            {
+                "symbol": r[0],
+                "signal_type": r[1],
+                "price_at_signal": _float_or_none(r[2]),
+                "price_at_eval": _float_or_none(r[3]),
+                "pnl_pct": round(_float_or_none(r[4]) or 0.0, 2),
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Compatibility keys used in prompt/formatter
+        base["top_losses"] = list(base.get("recent_losses") or [])
+        base["avg_pnl_pct"] = base.get("avg_pnl_on_resolved", 0.0)
+    finally:
+        cur.close()
+
+    return base
 
 
 def build_pulse_prompt(
@@ -814,6 +1124,8 @@ def build_pulse_prompt(
     preferences: dict | None = None,
     stock_intents: list | None = None,
     data_warning: str = "",
+    conn=None,
+    session_no: int = 0,
 ) -> tuple[str, str]:
     # Base rules from DB preferences + trader profile / intents on the system message
     prefs = preferences or {}
@@ -863,6 +1175,43 @@ def build_pulse_prompt(
     if trend_line:
         lines.append("")
         lines.append(trend_line)
+
+    dsex_change_pct = 0.0
+    if isinstance(mc.get("dsex_change_pct"), (int, float)):
+        dsex_change_pct = float(mc.get("dsex_change_pct") or 0.0)
+    else:
+        dsex_now = _float_or_none(mc.get("dsex_index"))
+        dsex_prev = _float_or_none((mc.get("previous") or {}).get("dsex_index"))
+        if dsex_now is not None and dsex_prev not in (None, 0):
+            dsex_change_pct = ((dsex_now - dsex_prev) / dsex_prev) * 100.0
+
+    intraday_trend = str((analysis.get("market_trend") or {}).get("trend") or "unknown").replace("_", " ")
+    vol_now = _float_or_none(mc.get("total_volume")) or 0.0
+    vol_prev = _float_or_none((mc.get("previous") or {}).get("total_volume")) or 0.0
+    if vol_prev > 0:
+        vol_delta = ((vol_now - vol_prev) / vol_prev) * 100.0
+        vol_comparison = f"{vol_delta:+.1f}% vs yesterday"
+    else:
+        vol_comparison = "n/a"
+
+    movers = get_top_movers_today(conn, session_no, limit=3)
+    movers_str = ", ".join(
+        f"{m.get('symbol')} ({(m.get('change_pct') or 0):+.2f}%)" for m in movers
+    ) if movers else "n/a"
+
+    prev_counts = get_previous_session_counts(conn, target_date, session_no)
+
+    lines.append("")
+    lines.append("INTRADAY CONTEXT (use this for your opening):")
+    lines.append(f"Session: {session_no} of 10")
+    lines.append(f"Intraday trend so far: {intraday_trend}")
+    lines.append(f"Volume vs yesterday: {vol_comparison}")
+    lines.append(f"Top movers this session: {movers_str}")
+    lines.append(f"DSEX change today: {dsex_change_pct:+.2f}%")
+    lines.append(
+        f"Previous session signal count: BUY {prev_counts['buy']} WATCH {prev_counts['watch']} EXIT {prev_counts['exit']}"
+    )
+
     lines.append("")
     lines.append(f"Top buy signals today ({buy_total}):")
     for b in buys:
@@ -896,7 +1245,25 @@ def build_pulse_prompt(
             f"  Signal: {p.get('signal')} — {p.get('reason')}"
         )
         if (p.get("pnl_pct") or 0) <= -8.0:
-            lines.append("  Note: urgent exit — position exceeds -8% drawdown threshold")
+            alert_count = get_position_alert_count(conn, trader_id, str(p.get("symbol")), target_date)
+            pnl_v = float(p.get("pnl_pct") or 0.0)
+            sym = str(p.get("symbol") or "UNKNOWN")
+            if alert_count >= 5:
+                urgency_text = (
+                    f"🚨 CRITICAL — {sym} DOWN {pnl_v:.1f}% FOR {alert_count} CONSECUTIVE SESSIONS. "
+                    f"IMMEDIATE EXIT REQUIRED. EVERY SESSION YOU HOLD INCREASES YOUR LOSS."
+                )
+            elif alert_count >= 3:
+                urgency_text = (
+                    f"⚠️ URGENT — {sym} DOWN {pnl_v:.1f}% FOR {alert_count} SESSIONS. "
+                    f"EXIT ON NEXT AVAILABLE PRICE. NO EXCEPTIONS."
+                )
+            else:
+                urgency_text = (
+                    f"❗ ALERT — {sym} DOWN {pnl_v:.1f}%. "
+                    f"STOP-LOSS THRESHOLD BREACHED. REVIEW POSITION."
+                )
+            lines.append(f"  {urgency_text}")
     lines.append("[END OF PORTFOLIO — do not reference any other stocks as portfolio positions]")
     lines.append("")
     lines.append(f"Watchlist ({len(watchlist)} stocks):")
@@ -929,28 +1296,33 @@ def build_pulse_prompt(
     lines.append(f"(trader_id={trader_id})")
 
     # Inject scorecard and accuracy context
-    if scorecard and scorecard.get("total_evaluated", 0) > 0:
+    if scorecard:
         sc = scorecard
         lines.append("")
         lines.append("NexTrade performance scorecard:")
-        lines.append(
-            f"Win rate: {sc['win_rate']}% "
-            f"({sc['wins']} wins / {sc['losses']} losses / {sc['neutrals']} neutral "
-            f"out of {sc['total_evaluated']} evaluated)"
-        )
+        if sc.get("win_rate") is None:
+            lines.append(sc.get("message") or "Building accuracy baseline — insufficient data")
+        else:
+            lines.append(
+                f"Win rate: {sc['win_rate']}% "
+                f"({sc.get('wins', 0)} wins / {sc.get('losses', 0)} losses, unresolved {sc.get('unresolved', 0)}) "
+                f"| Sample size: {sc.get('sample_size', 0)}"
+            )
+            lines.append(f"Avg P&L on resolved: {sc.get('avg_pnl_on_resolved', 0):+.2f}%")
         if sc.get("top_wins"):
             lines.append("Recent wins:")
             for w in sc["top_wins"][:3]:
                 lines.append(
-                    f"✅ {w['symbol']} {w['signal_type']} @ {w['price_at_signal']} "
-                    f"→ {w['price_at_eval']} ({w['pnl_pct']:+.1f}%)"
+                    f"✅ {w.get('symbol')} {w.get('signal_type', '')} @ {w.get('price_at_signal')} "
+                    f"→ {w.get('price_at_eval')} ({(w.get('pnl_pct') or 0):+.1f}%)"
                 )
-        if sc.get("top_losses"):
+        losses_key = sc.get("recent_losses") or sc.get("top_losses") or []
+        if losses_key:
             lines.append("Recent losses:")
-            for l in sc["top_losses"][:3]:
+            for l in losses_key[:3]:
                 lines.append(
-                    f"❌ {l['symbol']} {l['signal_type']} @ {l['price_at_signal']} "
-                    f"→ {l['price_at_eval']} ({l['pnl_pct']:+.1f}%)"
+                    f"❌ {l.get('symbol')} {l.get('signal_type', '')} @ {l.get('price_at_signal')} "
+                    f"→ {l.get('price_at_eval')} ({(l.get('pnl_pct') or 0):+.1f}%)"
                 )
     if accuracy_context:
         lines.append("")
@@ -1268,11 +1640,10 @@ def generate_pulse(trader_id: int) -> dict:
         try:
             from analysis.evaluator import (
                 evaluate_past_signals,
-                get_recent_scorecard,
                 get_accuracy_context_for_deepseek,
             )
             evaluate_past_signals(days_back=7)
-            scorecard = get_recent_scorecard(days=7)
+            scorecard = get_scorecard_data(conn, trader_id)
             accuracy_context = get_accuracy_context_for_deepseek()
         except Exception as ev_err:
             logger.warning("Evaluator error (non-fatal): %s", ev_err)
@@ -1283,6 +1654,8 @@ def generate_pulse(trader_id: int) -> dict:
             trader_context=trader_context,
             preferences=preferences, stock_intents=stock_intents,
             data_warning=data_warning,
+            conn=conn,
+            session_no=session_no,
         )
         deepseek_input = {"system": system_msg, "user": user_msg}
 
