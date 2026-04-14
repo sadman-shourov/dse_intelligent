@@ -1665,14 +1665,18 @@ def analyse_symbol(
     try:
         df = price_df.copy() if price_df is not None else get_price_history(symbol, days=90)
 
-        # Remove rows where ltp=0 AND volume=0 (non-trading days).
-        if "ltp" in df.columns and "volume" in df.columns:
-            df = df[(df["ltp"] > 0) | (df["volume"] > 0)]
-            df = df.reset_index(drop=True)
-
-        # After filter, re-check minimum rows.
         if len(df) < 20:
-            return {"status": "skipped", "symbol": symbol, "reason": "insufficient clean data"}
+            return {"status": "skipped", "symbol": symbol, "reason": "insufficient data"}
+
+        # Filter out rows where both ltp and volume are zero
+        # These are non-trading days that corrupt indicators
+        df = df[(df['ltp'] > 0) | (df['volume'] > 0)].copy()
+        df = df.reset_index(drop=True)
+
+        # Re-check minimum rows after filtering
+        if len(df) < 20:
+            return {"status": "skipped", "symbol": symbol,
+                    "reason": "insufficient clean data after filtering"}
 
         if target_date is None:
             _conn_td = get_db_connection()
@@ -2239,41 +2243,24 @@ def analyse_all_symbols() -> dict:
     ok_results: list[dict] = []
     signal_rows: list[dict] = []
 
-    # Serialize DataFrames → picklable records for ProcessPoolExecutor.
-    target_date_iso = target_date.isoformat()
-    worker_args: list[tuple] = []
-    for sym in symbols:
-        df = price_history_map.get(sym)
-        if df is not None and not df.empty:
-            # Convert date objects to ISO strings for pickling, then reconstruct in worker
-            rec = df.copy()
-            if "date" in rec.columns:
-                rec["date"] = rec["date"].astype(str)
-            records = rec.to_dict("records")
-            cols = list(rec.columns)
-        else:
-            records, cols = [], []
-        meta = metadata_map.get(sym, {})
-        worker_args.append((
-            sym,
-            records,
-            cols,
-            live_ticks_map.get(sym, []),
-            pe_ratios_map.get(sym),
-            eps_map.get(sym),
-            bool(meta.get("is_dsex", False)),
-            today_mkt,
-            prev_mkt,
-            target_date_iso,
-            market_ctx,
-            market_trend,
-            prev_signals,
-        ))
+    analyse_fn = partial(
+        analyse_symbol_with_data,
+        price_history_map=price_history_map,
+        live_ticks_map=live_ticks_map,
+        pe_ratios_map=pe_ratios_map,
+        eps_map=eps_map,
+        metadata_map=metadata_map,
+        today_market=today_mkt,
+        prev_market=prev_mkt,
+        target_date=target_date,
+        market_context=market_ctx,
+        market_trend=market_trend,
+        prev_signals=prev_signals,
+    )
 
-    n_workers = min(os.cpu_count() or 4, len(symbols))
     processed = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {executor.submit(_worker_analyse, args): args[0] for args in worker_args}
+    with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 4)) as executor:
+        futures = {executor.submit(analyse_fn, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             processed += 1
