@@ -1017,7 +1017,7 @@ def is_suspected_z_category(
     eps: float | None,
     is_dsex: bool,
 ) -> bool:
-    if len(df) < 90:
+    if len(df) < 10:
         return False
 
     avg_volume = float(df["volume"].tail(20).mean())
