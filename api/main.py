@@ -10,7 +10,7 @@ from typing import Any
 
 import psycopg2
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, Query
 from fastapi.responses import JSONResponse
 
 from ingestion.sync_stocks_master import sync_stocks_master
@@ -65,6 +65,30 @@ def _int(v: Any) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _stock_not_found_response(symbol: str) -> JSONResponse:
+    sym = (symbol or "").strip()
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Symbol not found",
+            "message": (
+                f"'{sym}' is not a valid DSE trading code. "
+                f"Try GET /stock/search?q={sym} to find the right code."
+            ),
+        },
+    )
+
+
+def _trader_not_found_response(trader_id: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Trader not found",
+            "message": f"No trader found with ID {trader_id}.",
+        },
+    )
 
 
 def _serialize(obj: Any) -> str:
@@ -145,6 +169,7 @@ def root():
             {"path": "/refresh/all", "method": "POST", "description": "Refresh market data and analysis"},
             {"path": "/refresh/prices", "method": "POST", "description": "Refresh prices and analysis"},
             {"path": "/refresh/analysis", "method": "POST", "description": "Refresh analysis only"},
+            {"path": "/stock/search", "method": "GET", "description": "Search DSE symbol (query param q); exact then fuzzy"},
             {"path": "/stock/search/{query}", "method": "GET", "description": "Search DSE stock symbol by name"},
             {"path": "/alerts/extreme-moves", "method": "POST", "description": "Check and send extreme move alerts"},
             {"path": "/alerts/pipeline-failure", "method": "POST", "description": "Send pipeline failure alert to all traders"},
@@ -171,6 +196,7 @@ def root():
             {"path": "/trader/{trader_id}/stock-intent", "method": "POST", "description": "Save or update a stock-specific intent"},
             {"path": "/trader/{trader_id}/stock-intents", "method": "GET", "description": "Get all active stock intents"},
             {"path": "/trader/{trader_id}/stock-intent/{symbol}", "method": "DELETE", "description": "Deactivate a stock intent"},
+            {"path": "/trader/by-chat-id/{chat_id}", "method": "GET", "description": "Look up active trader by Telegram chat ID (onboarding UX)"},
             {"path": "/trader/by-telegram/{telegram_chat_id}", "method": "GET", "description": "Look up trader by Telegram chat ID"},
         ]
     }
@@ -652,6 +678,79 @@ def premarket_endpoint(trader_id: int):
 # Chatbot endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/stock/search")
+def search_stocks(q: str = Query(..., min_length=1, description="DSE trading code fragment or full symbol")):
+    """Exact match first, then up to 5 active symbols containing the query."""
+    conn = None
+    cur = None
+    try:
+        qn = q.strip().upper()
+        if not qn:
+            return {
+                "matches": [],
+                "exact": False,
+                "message": "Query q cannot be empty.",
+            }
+        conn = _get_conn()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT symbol, is_dsex, is_active
+            FROM stocks_master
+            WHERE symbol = %s
+            """,
+            (qn,),
+        )
+        exact = cur.fetchone()
+        if exact:
+            return {
+                "matches": [{"symbol": exact[0], "is_dsex": exact[1]}],
+                "exact": True,
+            }
+
+        cur.execute(
+            """
+            SELECT symbol, is_dsex
+            FROM stocks_master
+            WHERE symbol ILIKE %s AND is_active = TRUE
+            ORDER BY
+                CASE WHEN symbol ILIKE %s THEN 0 ELSE 1 END,
+                symbol ASC
+            LIMIT 5
+            """,
+            (f"%{qn}%", f"{qn}%"),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            return {
+                "matches": [],
+                "exact": False,
+                "message": (
+                    f"No stocks found matching '{qn}'. "
+                    f"Try the full DSE trading code."
+                ),
+            }
+
+        return {
+            "matches": [{"symbol": r[0], "is_dsex": r[1]} for r in rows],
+            "exact": False,
+            "message": f"Found {len(rows)} matches for '{qn}'",
+        }
+    except Exception as e:
+        logger.exception("search_stocks error q=%s", q)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.close()
+
+
 @app.get("/stock/search/{query}")
 def search_symbol(query: str):
     conn = None
@@ -693,7 +792,7 @@ def get_stock(symbol: str):
         # Check symbol exists
         cur.execute("SELECT 1 FROM stocks_master WHERE symbol = %s", (symbol,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Symbol not found"})
+            return _stock_not_found_response(symbol)
 
         # Latest analysis
         cur.execute(
@@ -969,7 +1068,7 @@ def get_portfolio(trader_id: int):
         cur.execute("SELECT name FROM traders WHERE id = %s", (trader_id,))
         trader = cur.fetchone()
         if not trader:
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
         trader_name = trader[0] or f"Trader {trader_id}"
 
         # Open holdings
@@ -1116,12 +1215,14 @@ async def record_buy(trader_id: int, request: Request):
         target_price = _float(body.get("target_price"))
         trade_date_raw = body.get("date")
 
-        if not symbol:
-            return JSONResponse(status_code=400, content={"error": "symbol is required"})
-        if not quantity or quantity <= 0:
-            return JSONResponse(status_code=400, content={"error": "quantity must be > 0"})
-        if not price or price <= 0:
-            return JSONResponse(status_code=400, content={"error": "price must be > 0"})
+        if not symbol or not quantity or quantity <= 0 or not price or price <= 0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Invalid input",
+                    "message": "Required fields: symbol, quantity (>0), price (>0)",
+                },
+            )
 
         conn = _get_conn()
         conn.autocommit = True
@@ -1132,12 +1233,12 @@ async def record_buy(trader_id: int, request: Request):
         # Validate trader
         cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
 
         # Validate symbol
         cur.execute("SELECT 1 FROM stocks_master WHERE symbol = %s", (symbol,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Symbol not found"})
+            return _stock_not_found_response(symbol)
 
         total_value = round(quantity * price, 2)
 
@@ -1233,12 +1334,14 @@ async def record_sell(trader_id: int, request: Request):
         notes = body.get("notes") or ""
         trade_date_raw = body.get("date")
 
-        if not symbol:
-            return JSONResponse(status_code=400, content={"error": "symbol is required"})
-        if not quantity or quantity <= 0:
-            return JSONResponse(status_code=400, content={"error": "quantity must be > 0"})
-        if not price or price <= 0:
-            return JSONResponse(status_code=400, content={"error": "price must be > 0"})
+        if not symbol or not quantity or quantity <= 0 or not price or price <= 0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Invalid input",
+                    "message": "Required fields: symbol, quantity (>0), price (>0)",
+                },
+            )
 
         conn = _get_conn()
         conn.autocommit = True
@@ -1249,12 +1352,12 @@ async def record_sell(trader_id: int, request: Request):
         # Validate trader
         cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
 
         # Validate symbol
         cur.execute("SELECT 1 FROM stocks_master WHERE symbol = %s", (symbol,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Symbol not found"})
+            return _stock_not_found_response(symbol)
 
         # Check holdings
         cur.execute(
@@ -1267,14 +1370,32 @@ async def record_sell(trader_id: int, request: Request):
         )
         holding = cur.fetchone()
         if not holding:
-            return JSONResponse(status_code=400, content={"error": "Insufficient holdings: no open position for this symbol"})
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Insufficient holdings",
+                    "message": (
+                        f"You only have 0 shares of {symbol}. "
+                        f"Cannot sell {quantity}."
+                    ),
+                },
+            )
 
         h_id, old_qty, avg_px, old_total = holding
         old_qty = int(old_qty)
         avg_px = float(avg_px)
 
         if quantity > old_qty:
-            return JSONResponse(status_code=400, content={"error": f"Insufficient holdings: have {old_qty}, selling {quantity}"})
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Insufficient holdings",
+                    "message": (
+                        f"You only have {old_qty} shares of {symbol}. "
+                        f"Cannot sell {quantity}."
+                    ),
+                },
+            )
 
         total_value = round(quantity * price, 2)
 
@@ -1348,7 +1469,7 @@ def get_watchlist(trader_id: int):
 
         cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
 
         cur.execute(
             """
@@ -1426,15 +1547,31 @@ async def register_trader(request: Request):
     conn = None
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
         name = (body.get("name") or "").strip()
-        telegram_id = str(body.get("telegram_id") or "").strip()
+        chat_raw = body.get("chat_id") or body.get("telegram_id") or body.get("telegram_chat_id") or ""
+        telegram_id = str(chat_raw).strip()
         if not telegram_id:
-            return JSONResponse(status_code=400, content={"error": "telegram_id is required"})
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "chat_id is required",
+                    "message": "Required field: chat_id (Telegram chat ID).",
+                },
+            )
+        if not name:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "name is required",
+                    "message": "Required field: name.",
+                },
+            )
 
         conn = _get_conn()
         cur = conn.cursor()
 
-        # Check if already exists
         cur.execute(
             "SELECT id, name, onboarding_complete FROM traders WHERE telegram_chat_id = %s LIMIT 1",
             (telegram_id,),
@@ -1443,8 +1580,14 @@ async def register_trader(request: Request):
         if row:
             cur.close()
             return _jsonify({
-                "status": "existing",
-                "trader": {"trader_id": int(row[0]), "name": row[1] or "", "onboarding_complete": bool(row[2])},
+                "status": "exists",
+                "trader_id": int(row[0]),
+                "message": "Trader already registered",
+                "trader": {
+                    "trader_id": int(row[0]),
+                    "name": row[1] or "",
+                    "onboarding_complete": bool(row[2]),
+                },
             })
 
         cur.execute(
@@ -1459,7 +1602,10 @@ async def register_trader(request: Request):
         conn.commit()
         cur.close()
         return _jsonify({
-            "status": "created",
+            "status": "ok",
+            "trader_id": int(new_id),
+            "name": name,
+            "message": f"Welcome to ARIA, {name}! Your trading profile has been created.",
             "trader": {"trader_id": int(new_id), "name": name, "onboarding_complete": False},
         })
     except Exception as e:
@@ -1513,7 +1659,7 @@ async def complete_onboarding(trader_id: int, request: Request):
         row = cur.fetchone()
         cur.close()
         if not row:
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
         return _jsonify({
             "status": "ok",
             "trader_id": int(row[0]),
@@ -1545,7 +1691,7 @@ async def update_preferences(trader_id: int, request: Request):
         cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
         if not cur.fetchone():
             cur.close()
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
 
         patch = {k: v for k, v in body.items() if v is not None}
         patch_json = json.dumps(patch, default=str)
@@ -1592,7 +1738,7 @@ def get_preferences(trader_id: int):
         row = cur.fetchone()
         cur.close()
         if not row:
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
         prefs = row[0]
         if isinstance(prefs, str):
             prefs = json.loads(prefs)
@@ -1758,6 +1904,67 @@ def delete_stock_intent(trader_id: int, symbol: str):
             conn.close()
 
 
+@app.get("/trader/by-chat-id/{chat_id}")
+def get_trader_by_chat_id(chat_id: str):
+    conn = None
+    cur = None
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name, telegram_chat_id, is_active, timezone
+            FROM traders
+            WHERE telegram_chat_id = %s AND is_active = TRUE
+            """,
+            (str(chat_id).strip(),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "found": False,
+                    "message": "New user - onboarding required",
+                },
+            )
+
+        cur.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(total_invested), 0)
+            FROM portfolio_holdings
+            WHERE trader_id = %s AND is_open = TRUE
+            """,
+            (row[0],),
+        )
+        portfolio = cur.fetchone()
+        open_positions = int(portfolio[0] or 0)
+        total_invested = float(portfolio[1] or 0)
+        disp_name = (row[1] or "").strip() or f"Trader {int(row[0])}"
+        return _jsonify({
+            "found": True,
+            "trader_id": int(row[0]),
+            "name": disp_name,
+            "chat_id": row[2],
+            "is_active": bool(row[3]),
+            "timezone": row[4],
+            "open_positions": open_positions,
+            "total_invested": total_invested,
+            "message": f"Welcome back {disp_name}!",
+        })
+    except Exception as e:
+        logger.exception("get_trader_by_chat_id chat_id=%s", chat_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.close()
+
+
 @app.get("/trader/by-telegram/{telegram_chat_id}")
 def get_trader_by_telegram(telegram_chat_id: str):
     conn = None
@@ -1785,7 +1992,16 @@ def get_trader_by_telegram(telegram_chat_id: str):
         cur.execute(select_sql, (chat,))
         row = cur.fetchone()
         if not row:
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "Trader not found",
+                    "message": (
+                        "No trader registered for this Telegram chat ID. "
+                        "Use POST /trader/register with your chat_id."
+                    ),
+                },
+            )
         tid = int(row[0])
         name = (row[1] or "").strip() or f"Trader {tid}"
         result: dict = {"trader_id": tid, "name": name, "telegram_chat_id": chat}
@@ -1824,11 +2040,11 @@ async def watchlist_add(trader_id: int, request: Request):
 
         cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
 
         cur.execute("SELECT 1 FROM stocks_master WHERE symbol = %s", (symbol,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Symbol not found"})
+            return _stock_not_found_response(symbol)
 
         cur.execute(
             """
@@ -1866,7 +2082,7 @@ async def watchlist_remove(trader_id: int, request: Request):
 
         cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
         if not cur.fetchone():
-            return JSONResponse(status_code=404, content={"error": "Trader not found"})
+            return _trader_not_found_response(trader_id)
 
         cur.execute(
             """
