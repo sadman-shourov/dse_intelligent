@@ -1664,17 +1664,15 @@ def analyse_symbol(
 ) -> dict:
     try:
         df = price_df.copy() if price_df is not None else get_price_history(symbol, days=90)
-        if len(df) < 20:
-            return {"status": "skipped", "symbol": symbol, "reason": "insufficient data"}
 
-        # Skip symbols that effectively have no trading data in latest row.
-        latest_row = df.iloc[-1] if len(df) > 0 else None
-        latest_ltp = float(latest_row.get("ltp") or 0) if latest_row is not None else None
-        latest_volume = float(latest_row.get("volume") or 0) if latest_row is not None else None
-        latest_ltp = latest_ltp if latest_ltp is not None else 0.0
-        latest_volume = latest_volume if latest_volume is not None else 0.0
-        if latest_ltp == 0 and latest_volume == 0:
-            return {"status": "skipped", "symbol": symbol, "reason": "no trading data"}
+        # Remove rows where ltp=0 AND volume=0 (non-trading days).
+        if "ltp" in df.columns and "volume" in df.columns:
+            df = df[(df["ltp"] > 0) | (df["volume"] > 0)]
+            df = df.reset_index(drop=True)
+
+        # After filter, re-check minimum rows.
+        if len(df) < 20:
+            return {"status": "skipped", "symbol": symbol, "reason": "insufficient clean data"}
 
         if target_date is None:
             _conn_td = get_db_connection()
