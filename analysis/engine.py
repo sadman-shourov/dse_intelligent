@@ -1084,39 +1084,74 @@ def determine_overall_signal(
     rs: dict | None = None,
     market_context: dict | None = None,
     market_trend: dict | None = None,
-) -> tuple[str, float]:
+    history_len: int = 0,
+) -> tuple[str, float, int, dict]:
     score = 50
 
     cp = sr.get("current_price") or fib.get("current_price")
     supports = sr.get("support", []) or []
     resistances = sr.get("resistance", []) or []
 
+    score_breakdown = {
+        "base": 50,
+        "breakout": 0,
+        "rsi_oversold": 0,
+        "macd_bullish": 0,
+        "volume_high": 0,
+        "near_support": 0,
+        "dsex_bonus": 0,
+        "gambling_penalty": 0,
+        "rsi_overbought": 0,
+        "macd_bearish": 0,
+        "near_resistance": 0,
+        "market_bonus": 0,
+        "total": 0,
+    }
+    confirming_signals = 0
+
     if breakout.get("breakout"):
         score += 15
+        score_breakdown["breakout"] += 15
+        confirming_signals += 1
     if rsi.get("oversold"):
         score += 10
+        score_breakdown["rsi_oversold"] += 10
+        confirming_signals += 1
     if macd.get("signal") == "bullish_crossover":
         score += 10
+        score_breakdown["macd_bullish"] += 10
+        confirming_signals += 1
     if volume.get("signal") == "high":
         score += 10
+        score_breakdown["volume_high"] += 10
+        confirming_signals += 1
 
+    near_support = False
     if cp is not None and supports:
         nearest_support = min(supports, key=lambda x: abs(float(cp) - float(x)))
         if nearest_support and abs(float(cp) - float(nearest_support)) / float(nearest_support) <= 0.03:
             score += 5
+            score_breakdown["near_support"] += 5
+            near_support = True
+    if near_support:
+        confirming_signals += 1
 
     if rsi.get("overbought"):
         score -= 15
+        score_breakdown["rsi_overbought"] -= 15
     if macd.get("signal") == "bearish_crossover":
         score -= 10
+        score_breakdown["macd_bearish"] -= 10
 
     if cp is not None and resistances:
         nearest_res = min(resistances, key=lambda x: abs(float(cp) - float(x)))
         if nearest_res and abs(float(cp) - float(nearest_res)) / float(nearest_res) <= 0.01:
             score -= 10
+            score_breakdown["near_resistance"] -= 10
 
     if stock_class == "GAMBLING":
         score -= 20
+        score_breakdown["gambling_penalty"] -= 20
 
     # Intraday momentum scoring
     intraday = intraday or {}
@@ -1124,12 +1159,16 @@ def determine_overall_signal(
         mom = intraday.get("momentum", "")
         if mom == "strong_bullish":
             score += 12
+            score_breakdown["market_bonus"] += 12
         elif mom == "weak_bullish":
             score += 6
+            score_breakdown["market_bonus"] += 6
         elif mom == "strong_bearish":
             score -= 12
+            score_breakdown["market_bonus"] -= 12
         elif mom == "weak_bearish":
             score -= 6
+            score_breakdown["market_bonus"] -= 6
 
     # Relative strength scoring
     rs = rs or {}
@@ -1137,12 +1176,16 @@ def determine_overall_signal(
         rs_sig = rs.get("rs_signal", "")
         if rs_sig == "strong_outperform":
             score += 10
+            score_breakdown["market_bonus"] += 10
         elif rs_sig == "outperform":
             score += 5
+            score_breakdown["market_bonus"] += 5
         elif rs_sig == "strong_underperform":
             score -= 10
+            score_breakdown["market_bonus"] -= 10
         elif rs_sig == "underperform":
             score -= 5
+            score_breakdown["market_bonus"] -= 5
 
     # DSEX daily direction (from market_context if available, else fall back to summary pair)
     dsex_chg = None
@@ -1160,12 +1203,16 @@ def determine_overall_signal(
     dsex_chg = dsex_chg or 0
     if dsex_chg > 2:
         score += 8    # strong up day
+        score_breakdown["dsex_bonus"] += 8
     elif dsex_chg > 1:
         score += 4    # mild up day
+        score_breakdown["dsex_bonus"] += 4
     elif dsex_chg < -2:
         score -= 15   # strong down day — very cautious
+        score_breakdown["dsex_bonus"] -= 15
     elif dsex_chg < -1:
         score -= 10   # mild down day — cautious
+        score_breakdown["dsex_bonus"] -= 10
 
     # Multi-day market trend scoring
     mt = market_trend or {}
@@ -1175,18 +1222,24 @@ def determine_overall_signal(
 
     if trend == "downtrend":
         score -= 20   # 3+ consecutive down days
+        score_breakdown["market_bonus"] -= 20
         score = min(score, 64)   # never generate BUY in downtrend
     elif trend == "weak":
         score -= 12   # 5-day decline > 2%
+        score_breakdown["market_bonus"] -= 12
     elif trend == "uptrend":
         score += 10   # 3+ consecutive up days
+        score_breakdown["market_bonus"] += 10
     elif trend == "strong":
         score += 6    # 5-day gain > 2%
+        score_breakdown["market_bonus"] += 6
 
     if consecutive_down == 2:
         score -= 8
+        score_breakdown["market_bonus"] -= 8
     elif consecutive_down >= 3:
         score -= 20   # already captured in downtrend but stack it
+        score_breakdown["market_bonus"] -= 20
 
     flags = class_flags or {}
     if flags.get("mutual_fund"):
@@ -1197,19 +1250,46 @@ def determine_overall_signal(
         score = min(score, 35)
     if flags.get("is_dsex"):
         score += 5
+        score_breakdown["dsex_bonus"] += 5
 
     score = max(0, min(100, score))
 
-    if score >= 70:
+    # Hard BUY blockers (override score only for BUY assignment)
+    rsi_value = rsi.get("rsi")
+    try:
+        rsi_float = float(rsi_value) if rsi_value is not None else None
+    except (TypeError, ValueError):
+        rsi_float = None
+
+    hard_buy_blocked = False
+    if stock_class == "GAMBLING":
+        hard_buy_blocked = True
+    if flags.get("new_listing") or flags.get("suspected_z_category") or flags.get("mutual_fund"):
+        hard_buy_blocked = True
+    if history_len < 60:
+        hard_buy_blocked = True
+    if rsi_float is not None and rsi_float > 70:
+        hard_buy_blocked = True
+    if cp is not None and resistances:
+        try:
+            r0 = float(resistances[0])
+            if r0 > 0 and float(cp) > r0 * 1.05:
+                hard_buy_blocked = True
+        except (TypeError, ValueError):
+            pass
+
+    # Stricter thresholds + confirming-signal requirement for BUY
+    if score >= 80 and confirming_signals >= 2 and not hard_buy_blocked:
         signal = "BUY"
-    elif score >= 50:
+    elif score >= 60:
         signal = "WATCH"
-    elif score >= 30:
+    elif score >= 35:
         signal = "HOLD"
     else:
         signal = "EXIT"
 
-    return signal, round(score / 100.0, 2)
+    score_breakdown["total"] = int(round(score))
+    return signal, round(score / 100.0, 2), int(confirming_signals), score_breakdown
 
 
 def generate_trade_setup(
@@ -1648,7 +1728,7 @@ def analyse_symbol(
         rs = calculate_relative_strength(symbol_change_pct, market_context)
 
         stock_class, class_flags = classify_stock(symbol, df, pe, eps_val, is_dsex_b)
-        signal, confidence = determine_overall_signal(
+        signal, confidence, confirming_signals, score_breakdown = determine_overall_signal(
             sr,
             breakout,
             fib,
@@ -1663,6 +1743,7 @@ def analyse_symbol(
             rs=rs,
             market_context=market_context,
             market_trend=market_trend,
+            history_len=len(df),
         )
 
         # Stability filter for intraday session-to-session transitions.
@@ -1750,6 +1831,8 @@ def analyse_symbol(
                 "signal_reason": reason,
                 "market_trend": market_trend or {},
                 "trade_setup": trade_setup,
+                "confirming_signals": confirming_signals,
+                "score_breakdown": score_breakdown,
             },
             "signal_reason": reason,
             "price_at_signal": current_price,
@@ -2094,6 +2177,34 @@ def analyse_all_symbols() -> dict:
     for r in ok_results:
         if r.get("session_no") is None:
             r["session_no"] = run_session_no
+
+    # Hard daily BUY cap: keep top 20 BUYs by confidence, downgrade the rest to WATCH.
+    buy_results = [r for r in ok_results if r.get("overall_signal") == "BUY"]
+    if len(buy_results) > 20:
+        buy_results_sorted = sorted(buy_results, key=lambda x: float(x.get("confidence_score") or 0.0), reverse=True)
+        keep_symbols = {r.get("symbol") for r in buy_results_sorted[:20]}
+        downgraded = 0
+        for r in ok_results:
+            if r.get("overall_signal") == "BUY" and r.get("symbol") not in keep_symbols:
+                r["overall_signal"] = "WATCH"
+                downgraded += 1
+        print(f"BUY cap applied: kept top 20, downgraded {downgraded} to WATCH")
+
+    # Rebuild counters and signal rows after BUY cap adjustments.
+    buy_signals = sum(1 for r in ok_results if r.get("overall_signal") == "BUY")
+    watch_signals = sum(1 for r in ok_results if r.get("overall_signal") == "WATCH")
+    exit_signals = sum(1 for r in ok_results if r.get("overall_signal") == "EXIT")
+    signal_rows = [
+        {
+            "symbol": r.get("symbol"),
+            "signal_type": r.get("overall_signal"),
+            "signal_date": r.get("analysis_date"),
+            "price_at_signal": r.get("price_at_signal"),
+            "reason": r.get("signal_reason"),
+        }
+        for r in ok_results
+        if r.get("overall_signal") in ("BUY", "WATCH", "EXIT")
+    ]
 
     batch_upsert_analysis_results(ok_results)
     batch_upsert_signals(signal_rows)
