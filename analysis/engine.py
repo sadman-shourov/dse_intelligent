@@ -1640,6 +1640,15 @@ def analyse_symbol(
         if len(df) < 20:
             return {"status": "skipped", "symbol": symbol, "reason": "insufficient data"}
 
+        # Skip symbols that effectively have no trading data in latest row.
+        latest_row = df.iloc[-1] if len(df) > 0 else None
+        latest_ltp = float(latest_row.get("ltp") or 0) if latest_row is not None else None
+        latest_volume = float(latest_row.get("volume") or 0) if latest_row is not None else None
+        latest_ltp = latest_ltp if latest_ltp is not None else 0.0
+        latest_volume = latest_volume if latest_volume is not None else 0.0
+        if latest_ltp == 0 and latest_volume == 0:
+            return {"status": "skipped", "symbol": symbol, "reason": "no trading data"}
+
         if target_date is None:
             _conn_td = get_db_connection()
             try:
@@ -2179,16 +2188,18 @@ def analyse_all_symbols() -> dict:
             r["session_no"] = run_session_no
 
     # Hard daily BUY cap: keep top 20 BUYs by confidence, downgrade the rest to WATCH.
-    buy_results = [r for r in ok_results if r.get("overall_signal") == "BUY"]
+    buy_results = sorted(
+        [r for r in ok_results if r.get("overall_signal") == "BUY"],
+        key=lambda x: float(x.get("confidence_score") or 0.0),
+        reverse=True,
+    )
+    print(f"BUY signals before cap: {len(buy_results)}")
     if len(buy_results) > 20:
-        buy_results_sorted = sorted(buy_results, key=lambda x: float(x.get("confidence_score") or 0.0), reverse=True)
-        keep_symbols = {r.get("symbol") for r in buy_results_sorted[:20]}
-        downgraded = 0
-        for r in ok_results:
-            if r.get("overall_signal") == "BUY" and r.get("symbol") not in keep_symbols:
-                r["overall_signal"] = "WATCH"
-                downgraded += 1
-        print(f"BUY cap applied: kept top 20, downgraded {downgraded} to WATCH")
+        for r in buy_results[20:]:
+            r["overall_signal"] = "WATCH"
+        print(f"BUY cap: kept 20, downgraded {len(buy_results) - 20}")
+    else:
+        print(f"BUY cap: {len(buy_results)} signals, no cap needed")
 
     # Rebuild counters and signal rows after BUY cap adjustments.
     buy_signals = sum(1 for r in ok_results if r.get("overall_signal") == "BUY")

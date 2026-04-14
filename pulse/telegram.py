@@ -591,7 +591,7 @@ def send_extreme_move_alert(
     portfolio_moves = [m for m in moves if m["symbol"] in portfolio_symbols]
     market_moves = [m for m in moves if m["symbol"] not in portfolio_symbols]
 
-    message = "⚡ <b>ARIA Extreme Move Alert</b>\n\n"
+    message = "⚡ <b>NexTrade Extreme Move Alert</b>\n\n"
 
     if portfolio_moves:
         message += "🔴 <b>YOUR PORTFOLIO:</b>\n"
