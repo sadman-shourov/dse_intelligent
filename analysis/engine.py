@@ -1025,6 +1025,13 @@ def is_suspected_z_category(
     total_days = len(df)
     trading_consistency = trading_days / total_days if total_days else 0.0
 
+    # Stock with extremely thin volume AND price never moves
+    # (price_range < 0.5 means completely illiquid/halted)
+    price_range = df['close'].max() - df['close'].min()
+    no_price_movement = price_range < 0.5  # less than 0.5 BDT range in 90 days
+    if no_price_movement and avg_volume < 1000:
+        return True
+
     return all(
         [
             (eps is None or eps < 0),
