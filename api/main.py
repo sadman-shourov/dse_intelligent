@@ -1913,7 +1913,7 @@ def get_trader_by_chat_id(chat_id: str):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, name, telegram_chat_id, is_active, timezone
+            SELECT id, name, telegram_chat_id, is_active
             FROM traders
             WHERE telegram_chat_id = %s AND is_active = TRUE
             """,
@@ -1947,7 +1947,6 @@ def get_trader_by_chat_id(chat_id: str):
             "name": disp_name,
             "chat_id": row[2],
             "is_active": bool(row[3]),
-            "timezone": row[4],
             "open_positions": open_positions,
             "total_invested": total_invested,
             "message": f"Welcome back {disp_name}!",

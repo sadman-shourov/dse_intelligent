@@ -1532,7 +1532,7 @@ def format_telegram_message(
     if pulse_type == "premarket":
         head_block = (
             f"<b>🌅 NexTrade — Pre-Market Brief</b>\n"
-            f"📅 {day_str} · Market opens at 10:00am"
+            f"📅 {day_str} · Market opens at 10:15am"
         )
     elif pulse_type == "eod":
         head_block = (
@@ -1568,13 +1568,14 @@ def format_telegram_message(
 def _current_session_no_dhaka() -> int:
     tz = pytz.timezone("Asia/Dhaka")
     now_dhaka = datetime.now(tz)
-    market_open = time(10, 0)
-    market_close = time(14, 30)
+    market_open = time(10, 15)
+    market_close = time(14, 45)
     t = now_dhaka.time()
     if t < market_open or t > market_close:
         return 0
-    start_dt = now_dhaka.replace(hour=10, minute=0, second=0, microsecond=0)
-    session_no = (int((now_dhaka - start_dt).total_seconds() // 60) // 30) + 1
+    start_dt = now_dhaka.replace(hour=10, minute=15, second=0, microsecond=0)
+    elapsed_min = int((now_dhaka - start_dt).total_seconds() // 60)
+    session_no = elapsed_min // 30 + 1
     if session_no < 1 or session_no > 10:
         return 0
     return session_no
@@ -2028,7 +2029,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         # --- Build prompts ---
         lines: list[str] = []
         lines.append(f"PRE-MARKET BRIEFING — {target_date.isoformat()}")
-        lines.append("Market opens at 10:00am. Current time: 9:55am.")
+        lines.append("Market opens at 10:15am (Asia/Dhaka).")
         lines.append("")
         lines.append("YESTERDAY'S MARKET:")
         if dsex is not None:
