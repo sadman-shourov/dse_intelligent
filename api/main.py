@@ -585,22 +585,33 @@ def signals_today():
     try:
         conn = _get_conn()
         cur = conn.cursor()
-        today = _get_db_date(conn).isoformat()
         cur.execute(
             """
-            SELECT signal_type, symbol, price_at_signal, reason
-            FROM signals
-            WHERE signal_date = %s AND is_active = TRUE
-            ORDER BY signal_type, symbol
-            """,
-            (today,),
+            SELECT DISTINCT ON (symbol)
+                symbol,
+                overall_signal,
+                confidence_score,
+                raw_output->>'signal_reason' AS reason,
+                (raw_output->>'current_price')::numeric AS price
+            FROM analysis_results
+            WHERE analysis_date = CURRENT_DATE
+            ORDER BY symbol, confidence_score DESC
+            """
         )
         rows = cur.fetchall()
-        out: dict = {"date": today, "BUY": [], "WATCH": [], "EXIT": []}
-        for st, sym, price, reason in rows:
-            if st not in out:
-                continue
-            out[st].append({"symbol": sym, "price": _float(price), "reason": reason})
+
+        out: dict = {"BUY": [], "WATCH": [], "HOLD": [], "EXIT": []}
+        for sym, signal, _confidence, reason, price in rows:
+            if signal in out:
+                out[signal].append(
+                    {
+                        "symbol": sym,
+                        "price": float(price) if price is not None else 0,
+                        "reason": reason or "",
+                    }
+                )
+
+        out["date"] = str(date.today())
         return out
     except Exception as e:
         logger.exception("signals_today error")
@@ -834,18 +845,6 @@ def get_stock(symbol: str):
         )
         fund = cur.fetchone()
 
-        # Active signal
-        cur.execute(
-            """
-            SELECT signal_type, reason, signal_date
-            FROM signals
-            WHERE symbol = %s AND is_active = TRUE
-            ORDER BY signal_date DESC LIMIT 1
-            """,
-            (symbol,),
-        )
-        sig = cur.fetchone()
-
         cur.execute(
             "SELECT MAX(date) FROM price_history WHERE symbol = %s",
             (symbol,),
@@ -899,7 +898,7 @@ def get_stock(symbol: str):
             else analysis_date
         )
 
-        reason = sig[1] if sig else None
+        reason = (raw.get("signal_reason") if ar and isinstance(raw, dict) else None)
 
         return {
             "symbol": symbol,
@@ -971,10 +970,9 @@ def get_market_summary():
             """
             SELECT overall_signal, COUNT(DISTINCT symbol)
             FROM analysis_results
-            WHERE analysis_date = %s
+            WHERE analysis_date = CURRENT_DATE
             GROUP BY overall_signal
-            """,
-            (today,),
+            """
         )
         signal_counts: dict = {"BUY": 0, "WATCH": 0, "HOLD": 0, "EXIT": 0}
         for sig_type, cnt in cur.fetchall():

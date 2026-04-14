@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from functools import partial
 from pathlib import Path
@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
@@ -355,6 +356,37 @@ def bulk_fetch_eps() -> dict[str, float | None]:
             except Exception:
                 out[sym] = None
     return out
+
+
+def bulk_fetch_fundamentals() -> tuple[dict[str, float | None], dict[str, float | None]]:
+    """Fetch latest PE and EPS per symbol in one query."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (symbol) symbol, pe_ratio, eps
+            FROM stock_fundamentals
+            ORDER BY symbol, fetched_at DESC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    pe_map: dict[str, float | None] = {}
+    eps_map: dict[str, float | None] = {}
+    for sym, pe, eps in rows:
+        try:
+            pe_map[sym] = float(pe) if pe is not None else None
+        except Exception:
+            pe_map[sym] = None
+        try:
+            eps_map[sym] = float(eps) if eps is not None else None
+        except Exception:
+            eps_map[sym] = None
+    return pe_map, eps_map
 
 
 def bulk_fetch_stock_metadata() -> dict[str, dict]:
@@ -734,16 +766,11 @@ def calculate_support_resistance(df: pd.DataFrame) -> dict:
             return {"status": "skipped", "support": [], "resistance": [], "current_price": _current_price(df)}
 
         close = df["close"].astype(float).values
-        mins: list[float] = []
-        maxs: list[float] = []
-
-        for i in range(5, len(close) - 5):
-            window = close[i - 5 : i + 6]
-            c = close[i]
-            if c == np.min(window):
-                mins.append(float(c))
-            if c == np.max(window):
-                maxs.append(float(c))
+        series = pd.Series(close)
+        roll_min = series.rolling(window=11, center=True).min().values
+        roll_max = series.rolling(window=11, center=True).max().values
+        mins: list[float] = [float(close[i]) for i in range(5, len(close) - 5) if close[i] == roll_min[i]]
+        maxs: list[float] = [float(close[i]) for i in range(5, len(close) - 5) if close[i] == roll_max[i]]
 
         def cluster(levels: list[float]) -> list[float]:
             if not levels:
@@ -1626,9 +1653,9 @@ def analyse_symbol(
     live_tick: dict = None,            # kept for back-compat; ignored if live_ticks_today provided
     pe_ratio: float = None,
     eps: float = None,
+    is_dsex: bool = False,
     today_market: dict = None,
     prev_market: dict = None,
-    metadata_map: dict[str, dict] | None = None,
     target_date: date | None = None,
     live_ticks_today: list[dict] | None = None,  # full session list (CHANGE 2/3)
     market_context: dict | None = None,           # pre-computed context with dsex_change_pct
@@ -1710,10 +1737,11 @@ def analyse_symbol(
         pe = pe_ratio if pe_ratio is not None else get_pe_ratio(symbol)
         eps_val = eps if eps is not None else get_eps(symbol)
 
-        if metadata_map is not None:
-            is_dsex_b = bool(metadata_map.get(symbol, {}).get("is_dsex", False))
-        else:
+        # In bulk mode is_dsex is pre-fetched; single-symbol mode can fetch on demand.
+        if price_df is None and is_dsex is False:
             is_dsex_b = get_is_dsex(symbol)
+        else:
+            is_dsex_b = bool(is_dsex)
 
         sr = calculate_support_resistance(df)
         breakout = detect_breakout(df, sr.get("resistance", []))
@@ -1872,9 +1900,9 @@ def analyse_symbol_with_data(
         price_df=price_history_map.get(symbol),
         pe_ratio=pe_ratios_map.get(symbol),
         eps=eps_map.get(symbol),
+        is_dsex=bool(metadata_map.get(symbol, {}).get("is_dsex", False)),
         today_market=today_market,
         prev_market=prev_market,
-        metadata_map=metadata_map,
         target_date=target_date,
         live_ticks_today=live_ticks_today,
         market_context=market_context,
@@ -1931,10 +1959,33 @@ def batch_upsert_analysis_results(results: list[dict]) -> None:
             )
             for r in results
         ]
-        cur.executemany(sql, params)
+        psycopg2.extras.execute_batch(cur, sql, params, page_size=100)
     finally:
         cur.close()
         conn.close()
+
+
+# Cached schema flags — detected once on first call, reused thereafter.
+_signals_has_trader_id: bool | None = None
+_traders_has_is_active: bool | None = None
+
+
+def _detect_signals_schema(cur) -> tuple[bool, bool]:
+    global _signals_has_trader_id, _traders_has_is_active
+    if _signals_has_trader_id is None:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='signals'"
+        )
+        signal_cols = {r[0] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='traders'"
+        )
+        trader_cols = {r[0] for r in cur.fetchall()}
+        _signals_has_trader_id = "trader_id" in signal_cols
+        _traders_has_is_active = "is_active" in trader_cols
+    return _signals_has_trader_id, _traders_has_is_active
 
 
 def batch_upsert_signals(signals: list[dict]) -> None:
@@ -1945,13 +1996,21 @@ def batch_upsert_signals(signals: list[dict]) -> None:
     conn.autocommit = True
     cur = conn.cursor()
     try:
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='signals'")
-        signal_cols = {r[0] for r in cur.fetchall()}
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='traders'")
-        trader_cols = {r[0] for r in cur.fetchall()}
+        has_trader_id, has_is_active = _detect_signals_schema(cur)
 
-        if "trader_id" in signal_cols:
-            trader_filter = "WHERE t.is_active = TRUE" if "is_active" in trader_cols else ""
+        params = [
+            (
+                s["symbol"],
+                s["signal_type"],
+                s["signal_date"],
+                s.get("price_at_signal"),
+                s.get("reason"),
+            )
+            for s in signals
+        ]
+
+        if has_trader_id:
+            trader_filter = "WHERE t.is_active = TRUE" if has_is_active else ""
             sql = f"""
                 INSERT INTO signals (
                     trader_id, symbol, signal_type, signal_date,
@@ -1965,17 +2024,6 @@ def batch_upsert_signals(signals: list[dict]) -> None:
                     reason = EXCLUDED.reason,
                     is_active = EXCLUDED.is_active
             """
-            params = [
-                (
-                    s["symbol"],
-                    s["signal_type"],
-                    s["signal_date"],
-                    s.get("price_at_signal"),
-                    s.get("reason"),
-                )
-                for s in signals
-            ]
-            cur.executemany(sql, params)
         else:
             sql = """
                 INSERT INTO signals (
@@ -1988,17 +2036,7 @@ def batch_upsert_signals(signals: list[dict]) -> None:
                     reason = EXCLUDED.reason,
                     is_active = EXCLUDED.is_active
             """
-            params = [
-                (
-                    s["symbol"],
-                    s["signal_type"],
-                    s["signal_date"],
-                    s.get("price_at_signal"),
-                    s.get("reason"),
-                )
-                for s in signals
-            ]
-            cur.executemany(sql, params)
+        psycopg2.extras.execute_batch(cur, sql, params, page_size=100)
     finally:
         cur.close()
         conn.close()
@@ -2074,20 +2112,85 @@ def bulk_fetch_previous_signals(conn, target_date: date, session_no: int) -> dic
         cur.close()
 
 
+def _worker_analyse(args: tuple) -> dict:
+    """Top-level picklable worker for ProcessPoolExecutor.
+
+    Accepts primitives only (no DataFrames) so it can be pickled across processes.
+    Reconstructs DataFrames from records inside the worker process.
+    """
+    (
+        symbol,
+        price_records,       # list[dict] — JSON-safe records from df.to_dict('records')
+        price_cols,          # column order for DataFrame reconstruction
+        live_ticks_today,
+        pe_ratio,
+        eps,
+        is_dsex,
+        today_market,
+        prev_market,
+        target_date_iso,     # str ISO date
+        market_context,
+        market_trend,
+        prev_signals,
+    ) = args
+
+    target_date = date.fromisoformat(target_date_iso)
+    if price_records:
+        price_df = pd.DataFrame(price_records, columns=price_cols)
+        # Restore date column type
+        if "date" in price_df.columns:
+            price_df["date"] = pd.to_datetime(price_df["date"]).dt.date
+    else:
+        price_df = pd.DataFrame()
+
+    return analyse_symbol(
+        symbol,
+        price_df=price_df,
+        pe_ratio=pe_ratio,
+        eps=eps,
+        is_dsex=is_dsex,
+        today_market=today_market,
+        prev_market=prev_market,
+        target_date=target_date,
+        live_ticks_today=live_ticks_today,
+        market_context=market_context,
+        market_trend=market_trend,
+        prev_signals=prev_signals,
+    )
+
+
 def analyse_all_symbols() -> dict:
     start = time.time()
     run_session_no = _compute_session_no()
 
-    # cleanup signals once per run
     conn = get_db_connection()
     conn.autocommit = True
     target_date = get_db_date(conn)
     cur = conn.cursor()
     try:
+        # Root-cause cleanup: remove today's analysis rows for active symbols.
+        cur.execute(
+            """
+            DELETE FROM analysis_results
+            WHERE analysis_date = %s
+              AND symbol IN (
+                  SELECT symbol FROM stocks_master WHERE is_active = TRUE
+              )
+            """,
+            (target_date,),
+        )
+        # Deactivate today's signals so fresh run is the source of truth.
+        cur.execute(
+            """
+            UPDATE signals SET is_active = FALSE
+            WHERE signal_date = %s
+            """,
+            (target_date,),
+        )
         cur.execute("DELETE FROM signals WHERE reason = 'auto-hold' OR reason IS NULL")
         cur.execute(
             "UPDATE signals SET is_active = FALSE WHERE signal_date < %s AND is_active = TRUE",
-            (target_date.isoformat(),),
+            (target_date,),
         )
         cur.execute("SELECT symbol FROM stocks_master WHERE is_active = TRUE ORDER BY symbol ASC")
         symbols = [r[0] for r in cur.fetchall()]
@@ -2095,13 +2198,26 @@ def analyse_all_symbols() -> dict:
         cur.close()
         conn.close()
 
-    price_history_map = bulk_fetch_price_history(90)
-    live_ticks_map = bulk_fetch_live_ticks()      # now dict[str, list[dict]]
-    pe_ratios_map = bulk_fetch_pe_ratios()
-    eps_map = bulk_fetch_eps()
-    metadata_map = bulk_fetch_stock_metadata()
-    today_mkt, prev_mkt = bulk_fetch_market_summary()
-    market_ctx = bulk_fetch_market_context(target_date)
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=6) as _loader:
+        f_price   = _loader.submit(bulk_fetch_price_history, 90)
+        f_ticks   = _loader.submit(bulk_fetch_live_ticks)
+        f_fund    = _loader.submit(bulk_fetch_fundamentals)
+        f_meta    = _loader.submit(bulk_fetch_stock_metadata)
+        f_mkt     = _loader.submit(bulk_fetch_market_summary)
+        f_ctx     = _loader.submit(bulk_fetch_market_context, target_date)
+
+        price_history_map       = f_price.result()
+        live_ticks_map          = f_ticks.result()
+        pe_ratios_map, eps_map  = f_fund.result()
+        metadata_map            = f_meta.result()
+        today_mkt, prev_mkt     = f_mkt.result()
+        market_ctx              = f_ctx.result()
+
+    print(f"All bulk data loaded in {time.time()-t0:.1f}s "
+          f"(price={len(price_history_map)}, ticks={len(live_ticks_map)}, "
+          f"fund={len(pe_ratios_map)}, meta={len(metadata_map)})")
+
     market_trend = bulk_fetch_market_trend()
     conn_prev = get_db_connection()
     try:
@@ -2125,24 +2241,41 @@ def analyse_all_symbols() -> dict:
     ok_results: list[dict] = []
     signal_rows: list[dict] = []
 
-    analyse_fn = partial(
-        analyse_symbol_with_data,
-        price_history_map=price_history_map,
-        live_ticks_map=live_ticks_map,
-        pe_ratios_map=pe_ratios_map,
-        eps_map=eps_map,
-        metadata_map=metadata_map,
-        today_market=today_mkt,
-        prev_market=prev_mkt,
-        target_date=target_date,
-        market_context=market_ctx,
-        market_trend=market_trend,
-        prev_signals=prev_signals,
-    )
+    # Serialize DataFrames → picklable records for ProcessPoolExecutor.
+    target_date_iso = target_date.isoformat()
+    worker_args: list[tuple] = []
+    for sym in symbols:
+        df = price_history_map.get(sym)
+        if df is not None and not df.empty:
+            # Convert date objects to ISO strings for pickling, then reconstruct in worker
+            rec = df.copy()
+            if "date" in rec.columns:
+                rec["date"] = rec["date"].astype(str)
+            records = rec.to_dict("records")
+            cols = list(rec.columns)
+        else:
+            records, cols = [], []
+        meta = metadata_map.get(sym, {})
+        worker_args.append((
+            sym,
+            records,
+            cols,
+            live_ticks_map.get(sym, []),
+            pe_ratios_map.get(sym),
+            eps_map.get(sym),
+            bool(meta.get("is_dsex", False)),
+            today_mkt,
+            prev_mkt,
+            target_date_iso,
+            market_ctx,
+            market_trend,
+            prev_signals,
+        ))
 
+    n_workers = min(os.cpu_count() or 4, len(symbols))
     processed = 0
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(analyse_fn, symbol): symbol for symbol in symbols}
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_worker_analyse, args): args[0] for args in worker_args}
         for future in as_completed(futures):
             symbol = futures[future]
             processed += 1
