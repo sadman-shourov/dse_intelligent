@@ -8,7 +8,7 @@ import re
 import sys
 import traceback
 from collections import defaultdict
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1143,6 +1143,37 @@ def should_send_pulse(
     if session_no == 1:
         return True, "first_session", meta
 
+    # Check: periodic market update even when quiet
+    if session_no is not None and session_no > 0:
+        if session_no % 3 == 0:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT sent_at FROM pulse_log
+                    WHERE trader_id = %s
+                      AND pulse_date = %s
+                      AND telegram_sent = TRUE
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (trader_id, target_date),
+                )
+                row = cur.fetchone()
+            finally:
+                cur.close()
+
+            if row is None:
+                return True, "market_update", meta
+
+            last_sent = row[0]
+            if last_sent:
+                now_utc = datetime.now(timezone.utc)
+                if last_sent.tzinfo is None:
+                    last_sent = last_sent.replace(tzinfo=timezone.utc)
+                mins_since = (now_utc - last_sent).total_seconds() / 60
+                if mins_since >= 90:
+                    return True, "market_update", meta
+
     return False, "nothing_actionable", meta
 
 
@@ -1369,6 +1400,30 @@ def build_proactive_pulse(
             f"Focus for today: prioritise risk, then highest conviction NOW setups.\n"
         )
 
+    elif send_reason == "market_update":
+        buy_count = len(analysis_summary.get("buy_signals", []))
+        watch_count = analysis_summary.get("watch_signal_total", 0)
+        user_msg = (
+            f"MARKET UPDATE — Session {session_no}\n"
+            f"Date: {target_date.isoformat()}\n"
+            f"DSEX (last close): {dsex_str}\n\n"
+            f"CURRENT SIGNALS:\n"
+            f"BUY: {buy_count} | WATCH: {watch_count}\n\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"WATCH LIST:\n"
+        )
+        for w in get_trader_watchlist(conn, trader_id):
+            user_msg += (
+                f"- {w['symbol']}: "
+                f"{w.get('current_price', 'n/a')} | "
+                f"{w.get('signal', 'n/a')}\n"
+            )
+        user_msg += (
+            f"\nNo major setups confirmed yet. "
+            f"Market is {market_context.get('dsex_change_pct', 0):+.1f}% "
+            f"vs yesterday. Watching for opportunities.\n"
+        )
+
     else:
         user_msg = (
             f"SESSION {session_no} — {target_date.isoformat()}\n"
@@ -1450,7 +1505,7 @@ def format_telegram_message(
     elif session_no == 0:
         session_str = "End of Day"
     else:
-        session_str = f"Session {session_no} of 10"
+        session_str = f"Session {session_no}"
 
     headers = {
         "new_trade_setup": "🚨 NexTrade — Live Trade Alert",

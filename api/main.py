@@ -4,11 +4,12 @@ import json
 import logging
 import os
 import traceback
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 from typing import Any
 
 import psycopg2
+import pytz
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Body, Query
 from fastapi.responses import JSONResponse
@@ -65,6 +66,25 @@ def _int(v: Any) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _market_status_context() -> dict[str, Any]:
+    dhaka = pytz.timezone("Asia/Dhaka")
+    now = datetime.now(dhaka)
+    # DSE trading days: Sun, Mon, Tue, Wed, Thu
+    is_dse_day = now.weekday() in [0, 1, 2, 3, 6]
+    market_open_time = dtime(10, 0)
+    market_close_time = dtime(14, 30)
+    current_time = now.time()
+    is_market_open = (
+        is_dse_day and
+        market_open_time <= current_time <= market_close_time
+    )
+    return {
+        "is_market_open": is_market_open,
+        "market_status": "Open" if is_market_open else "Closed",
+        "current_time_dhaka": now.strftime("%I:%M %p"),
+    }
 
 
 def _stock_not_found_response(symbol: str) -> JSONResponse:
@@ -900,6 +920,8 @@ def get_stock(symbol: str):
 
         reason = (raw.get("signal_reason") if ar and isinstance(raw, dict) else None)
 
+        market_ctx = _market_status_context()
+
         return {
             "symbol": symbol,
             "stock_class": stock_class,
@@ -920,6 +942,9 @@ def get_stock(symbol: str):
             "analysis_date": analysis_date,
             "data_as_of": data_as_of,
             "class_flags": class_flags,
+            "is_market_open": market_ctx["is_market_open"],
+            "market_status": market_ctx["market_status"],
+            "current_time_dhaka": market_ctx["current_time_dhaka"],
         }
     except Exception as e:
         logger.exception("get_stock error symbol=%s", symbol)
@@ -1031,6 +1056,9 @@ def get_market_summary():
             })
 
 
+        market_ctx = _market_status_context()
+        is_market_open = market_ctx["is_market_open"]
+
         return {
             "date": today.strftime("%d %b %Y"),
             "dsex": _float(ms[1]) if ms else None,
@@ -1040,6 +1068,15 @@ def get_market_summary():
             "signals": signal_counts,
             "top_buys": top_buys,
             "top_exits": top_exits,
+            "is_market_open": is_market_open,
+            "market_status": "Open" if is_market_open else "Closed",
+            "current_time_dhaka": market_ctx["current_time_dhaka"],
+            "dsex_note": (
+                "Live DSEX index unavailable. Showing last close."
+                if not is_market_open
+                else "DSEX as of yesterday's close. Updates after 4:10pm."
+            ),
+            "dsex_date": ms[0].isoformat() if ms else None,
         }
     except Exception as e:
         logger.exception("get_market_summary error")

@@ -586,35 +586,63 @@ def send_extreme_move_alert(
     chat_id: str,
     moves: list[dict],
     portfolio_symbols: set[str],
+    watchlist_symbols: set[str],
 ) -> dict:
     """Build and send an extreme move alert to one trader."""
-    portfolio_moves = [m for m in moves if m["symbol"] in portfolio_symbols]
-    market_moves = [m for m in moves if m["symbol"] not in portfolio_symbols]
-
     message = "⚡ <b>NexTrade Extreme Move Alert</b>\n\n"
 
-    if portfolio_moves:
-        message += "🔴 <b>YOUR PORTFOLIO:</b>\n"
-        for m in portfolio_moves:
-            emoji = "🚀" if m["direction"] == "up" else "💥"
-            message += (
-                f"{emoji} <b>{m['symbol']}</b>: "
-                f"{m['change_pct']:+.1f}% @ {m['current_price']}\n"
-            )
-            if m["direction"] == "down" and abs(m["change_pct"]) >= 8:
-                message += "   ⚠️ STOP-LOSS ZONE — Review immediately\n"
-        message += "\n"
+    for m in moves:
+        symbol = m["symbol"]
+        direction = m.get("direction")
+        change_pct = float(m.get("change_pct") or 0.0)
+        price = m.get("current_price")
 
-    if market_moves[:5]:
-        message += "📊 <b>MARKET MOVERS:</b>\n"
-        for m in market_moves[:5]:
-            emoji = "📈" if m["direction"] == "up" else "📉"
-            message += (
-                f"{emoji} {m['symbol']}: "
-                f"{m['change_pct']:+.1f}% @ {m['current_price']}\n"
+        if symbol in portfolio_symbols:
+            if direction == "up" and change_pct > 5:
+                action_line = (
+                    "Consider taking partial profit. "
+                    f"You're up {change_pct:.1f}% on this position."
+                )
+            elif direction == "down" and abs(change_pct) > 5:
+                action_line = (
+                    "⚠️ Review stop loss. "
+                    f"Down {abs(change_pct):.1f}% on your position."
+                )
+            else:
+                action_line = "Monitor this holding closely for follow-through."
+        elif symbol in watchlist_symbols and direction == "up":
+            action_line = (
+                "This was on your watchlist — "
+                "it's moving. Check if setup is still valid."
             )
+        else:
+            if direction == "up" and change_pct > 15:
+                action_line = (
+                    "Already moved significantly. "
+                    "Too late to chase — watch for pullback."
+                )
+            elif direction == "up" and 5 <= change_pct <= 15:
+                action_line = (
+                    "Breaking out. "
+                    "Check if it's on your radar."
+                )
+            else:
+                action_line = (
+                    "Selling pressure — "
+                    "avoid unless you have specific reason."
+                )
 
-    message += f"\n<i>Session {moves[0]['session_no']} | {len(moves)} stocks moved >5%</i>"
+        emoji = "🚀" if direction == "up" else "📉"
+        message += (
+            f"{emoji} {symbol}: {change_pct:+.1f}% @ {price}\n"
+            f"   → {action_line}\n"
+        )
+
+    message += (
+        f"\n<i>Session {moves[0]['session_no']} | {len(moves)} stocks moved >5%</i>"
+        "\n\nWant analysis on any of these?\n"
+        "Just ask: 'tell me about SYMBOL'"
+    )
 
     return send_telegram_message(chat_id=chat_id, message=message, parse_mode="HTML")
 
@@ -671,8 +699,25 @@ def deliver_extreme_move_alerts(moves: list[dict]) -> dict:
                 details.append({"trader_id": tid, "name": name, "status": "skipped", "reason": "no relevant moves"})
                 continue
 
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT symbol FROM trader_watchlist
+                WHERE trader_id = %s AND is_active = TRUE
+                """,
+                (tid,),
+            )
+            watchlist_symbols: set[str] = {r[0] for r in cur.fetchall()}
+            cur.close()
+
             try:
-                res = send_extreme_move_alert(tid, chat, new_moves, portfolio_symbols)
+                res = send_extreme_move_alert(
+                    tid,
+                    chat,
+                    new_moves,
+                    portfolio_symbols,
+                    watchlist_symbols,
+                )
             except Exception as e:
                 logger.exception("send_extreme_move_alert failed for trader %s", tid)
                 details.append({"trader_id": tid, "name": name, "status": "error", "error": str(e)})

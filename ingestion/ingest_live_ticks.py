@@ -27,7 +27,7 @@ def get_db_date(conn) -> date:
 
 
 def _compute_session_info(now_dhaka: datetime) -> tuple[int | None, str | None]:
-    # Sessions: 10:15=1 … 14:45=10 (30-minute slots; window 10:15–14:45 Asia/Dhaka)
+    # Sessions: 10:15=1 … 14:45=27 (10-minute slots; window 10:15–14:45 Asia/Dhaka)
     market_open = time(10, 15)
     market_close = time(14, 45)
     t = now_dhaka.time()
@@ -35,10 +35,10 @@ def _compute_session_info(now_dhaka: datetime) -> tuple[int | None, str | None]:
         return None, None
     start_dt = now_dhaka.replace(hour=10, minute=15, second=0, microsecond=0)
     elapsed_min = int((now_dhaka - start_dt).total_seconds() // 60)
-    session_no = elapsed_min // 30 + 1
-    if session_no < 1 or session_no > 10:
+    session_no = elapsed_min // 10 + 1
+    if session_no < 1 or session_no > 27:
         return None, None
-    session_start = start_dt + timedelta(minutes=(session_no - 1) * 30)
+    session_start = start_dt + timedelta(minutes=(session_no - 1) * 10)
     session_time = session_start.strftime("%-I:%M%p").lower()
     return session_no, session_time
 
