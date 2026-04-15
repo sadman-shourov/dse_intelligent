@@ -2045,17 +2045,20 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         for w in watch_signals:
             lines.append(f"- {w['symbol']} @ {w['current_price']} | {w['reason']}")
         lines.append("")
-        lines.append(f"TRADER PORTFOLIO ({len(portfolio)} positions):")
-        for p in portfolio:
-            sym = p["symbol"]
-            sup = support_by_sym.get(sym, [])
-            sup_str = str(sup[0]) if sup else "N/A"
-            at_sl = " — at stop-loss threshold; review at open" if (p.get("pnl_pct") or 0) <= -8 else ""
-            lines.append(
-                f"- {sym}: {p['quantity']} shares @ avg {p['avg_buy_price']}\n"
-                f"  Current: {p['current_price']} | P&L: {p.get('pnl_pct', 0):+.1f}%\n"
-                f"  Key support: {sup_str}{at_sl}"
-            )
+        if not portfolio:
+            lines.append("TRADER PORTFOLIO: Empty. No open positions.")
+        else:
+            lines.append(f"TRADER PORTFOLIO ({len(portfolio)} positions):")
+            for p in portfolio:
+                sym = p["symbol"]
+                sup = support_by_sym.get(sym, [])
+                sup_str = str(sup[0]) if sup else "N/A"
+                at_sl = " — at stop-loss threshold; review at open" if (p.get("pnl_pct") or 0) <= -8 else ""
+                lines.append(
+                    f"- {sym}: {p['quantity']} shares @ avg {p['avg_buy_price']}\n"
+                    f"  Current: {p['current_price']} | P&L: {p.get('pnl_pct', 0):+.1f}%\n"
+                    f"  Key support: {sup_str}{at_sl}"
+                )
         lines.append("")
         lines.append(f"WATCHLIST ({len(watchlist)} stocks):")
         for w in watchlist:
