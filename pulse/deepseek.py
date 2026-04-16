@@ -1348,8 +1348,52 @@ def build_proactive_pulse(
 
     dsex = _float_or_none(market_context.get("dsex_index"))
     dsex_ch = _float_or_none(market_context.get("dsex_change_pct"))
-    dsex_str = f"{dsex:.2f}" if dsex is not None else "n/a"
-    ch_str = f"{dsex_ch:+.1f}%" if dsex_ch is not None else "n/a"
+
+    dhaka = pytz.timezone("Asia/Dhaka")
+    now = datetime.now(dhaka)
+    market_open = now.replace(hour=10, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=14, minute=30, second=0, microsecond=0)
+    is_market_hours = market_open <= now <= market_close
+
+    data_date_raw = market_context.get("data_date")
+    data_date_obj = None
+    if isinstance(data_date_raw, date):
+        data_date_obj = data_date_raw
+    elif isinstance(data_date_raw, str) and data_date_raw.strip():
+        try:
+            data_date_obj = datetime.fromisoformat(data_date_raw).date()
+        except ValueError:
+            data_date_obj = None
+
+    today_dhaka = now.date()
+    yesterday_dhaka = today_dhaka - timedelta(days=1)
+    has_fresh_dsex = (
+        (not is_market_hours)
+        and dsex is not None
+        and data_date_obj in (today_dhaka, yesterday_dhaka)
+    )
+
+    if is_market_hours:
+        dsex_str = "DSEX: Not available during market hours"
+        ch_str = ""
+        dsex_context_line = (
+            "DSEX: Updates after market close. "
+            "Do not mention DSEX value in this message."
+        )
+    elif not has_fresh_dsex:
+        dsex_str = "DSEX: Data not yet available"
+        ch_str = ""
+        dsex_context_line = (
+            "DSEX: Not yet updated. "
+            "Do not mention or invent any DSEX value."
+        )
+    else:
+        dsex_str = f"{dsex:.2f}"
+        ch_str = f"{dsex_ch:+.1f}%" if dsex_ch is not None else ""
+        if ch_str:
+            dsex_context_line = f"DSEX: {dsex_str} ({ch_str})"
+        else:
+            dsex_context_line = f"DSEX: {dsex_str}"
 
     def _fmt_setup_block(rows: list[dict], *, now_sizing: bool = False) -> str:
         lines: list[str] = []
@@ -1413,7 +1457,7 @@ def build_proactive_pulse(
         user_msg = (
             f"TRADE ALERT — Session {session_no}\n"
             f"Date: {target_date.isoformat()}\n"
-            f"DSEX: {dsex_str} ({ch_str})\n\n"
+            f"{dsex_context_line}\n\n"
             f"NEW SETUP(S) CONFIRMED:\n"
             f"{_fmt_setup_block(now_rows, now_sizing=True)}\n\n"
             f"TRADER PORTFOLIO:\n{_portfolio_lines()}\n\n"
@@ -1451,10 +1495,14 @@ def build_proactive_pulse(
         )
 
     elif send_reason == "market_significant_move":
-        direction = "up" if (dsex_ch or 0) >= 0 else "down"
+        if has_fresh_dsex and dsex_ch is not None:
+            direction = "up" if dsex_ch >= 0 else "down"
+            dsex_move_line = f"DSEX {direction} {abs(dsex_ch):.1f}% (session context)."
+        else:
+            dsex_move_line = dsex_context_line
         user_msg = (
             f"MARKET MOVE ALERT\n\n"
-            f"DSEX {direction} {abs(dsex_ch or 0):.1f}% (session context).\n"
+            f"{dsex_move_line}\n"
             f"Impact on your portfolio:\n{_portfolio_lines()}\n\n"
             f"Active setups (NOW):\n{_fmt_setup_block(now_rows, now_sizing=True)}\n"
         )
@@ -1480,7 +1528,7 @@ def build_proactive_pulse(
         prev_s = f"{prev_dsex:.2f}" if prev_dsex is not None else "n/a"
         user_msg = (
             f"MARKET OPEN — Session 1\n"
-            f"DSEX: {dsex_str} | Yesterday close: {prev_s}\n\n"
+            f"{dsex_context_line}\nYesterday close: {prev_s}\n\n"
             f"ACTIVE SETUPS TODAY:\n"
             f"NOW:\n{_fmt_setup_block(now_rows, now_sizing=True)}\n\n"
             f"WATCH:\n{_fmt_setup_block(watch_rows, now_sizing=False)}\n\n"
@@ -1494,7 +1542,7 @@ def build_proactive_pulse(
         user_msg = (
             f"MARKET UPDATE — Session {session_no}\n"
             f"Date: {target_date.isoformat()}\n"
-            f"DSEX (last close): {dsex_str}\n\n"
+            f"{dsex_context_line}\n\n"
             f"CURRENT SIGNALS:\n"
             f"BUY: {buy_count} | WATCH: {watch_count}\n\n"
             f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
@@ -1506,11 +1554,17 @@ def build_proactive_pulse(
                 f"{w.get('current_price', 'n/a')} | "
                 f"{w.get('signal', 'n/a')}\n"
             )
-        user_msg += (
-            f"\nNo major setups confirmed yet. "
-            f"Market is {market_context.get('dsex_change_pct', 0):+.1f}% "
-            f"vs yesterday. Watching for opportunities.\n"
-        )
+        if has_fresh_dsex and dsex_ch is not None:
+            user_msg += (
+                f"\nNo major setups confirmed yet. "
+                f"Market is {dsex_ch:+.1f}% "
+                f"vs yesterday. Watching for opportunities.\n"
+            )
+        else:
+            user_msg += (
+                "\nNo major setups confirmed yet. "
+                "DSEX updates after market close. Watching for opportunities.\n"
+            )
 
     elif send_reason == "setup_forming":
         new_setups = meta.get("new_forming", [])
@@ -1554,7 +1608,7 @@ def build_proactive_pulse(
             f"SETUP FORMING ALERT\n"
             f"Session: {session_no}\n"
             f"Date: {target_date}\n"
-            f"DSEX: {dsex_str} ({ch_str})\n\n"
+            f"{dsex_context_line}\n\n"
             f"SETUPS BUILDING — NOT BUY SIGNALS YET:\n\n"
             f"{setups_block}\n\n"
             f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
@@ -1566,7 +1620,7 @@ def build_proactive_pulse(
     else:
         user_msg = (
             f"SESSION {session_no} — {target_date.isoformat()}\n"
-            f"DSEX {dsex_str} ({ch_str})\n"
+            f"{dsex_context_line}\n"
             f"PORTFOLIO:\n{_portfolio_lines()}\n"
         )
 
