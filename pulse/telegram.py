@@ -624,6 +624,7 @@ def fetch_extreme_move_analysis(conn, symbol: str) -> dict[str, Any]:
         return {
             "rsi": rsi_f,
             "volume_pattern": vp_norm,
+            "volume_price_pattern": vp_norm,
             "above_ma50": _parse_above_ma50_flag(am),
         }
     finally:
@@ -663,13 +664,40 @@ def _format_extreme_move_ma_context(above_ma50: bool | None) -> str | None:
     return None
 
 
+def _mover_sustainability(move: dict, analysis: dict) -> str:
+    """Returns: 'confirmed' / 'counter_trend' / 'distribution' / 'unknown'."""
+    above_ma50 = analysis.get("above_ma50")
+    vp = analysis.get("volume_price_pattern", "")
+    rsi = analysis.get("rsi")
+    change = abs(float(move.get("change_pct") or 0))
+    _ = change
+
+    if vp == "distribution":
+        return "distribution"
+    if above_ma50 is False:
+        return "counter_trend"
+    if above_ma50 is True and vp in ("bullish_momentum", "accumulation"):
+        return "confirmed"
+    if rsi and float(rsi) > 75:
+        return "counter_trend"
+    return "unknown"
+
+
 def _extreme_move_action_guidance(
     direction: str | None,
     change_pct: float,
     in_portfolio: bool,
     in_watchlist: bool,
     rsi: float | None,
+    sustainability: str,
 ) -> str:
+    if sustainability == "counter_trend":
+        return "Counter-trend spike — high reversal risk. Wait for close to confirm."
+    if sustainability == "distribution":
+        return "Institutions selling into this move. Avoid buying here."
+    if sustainability == "unknown":
+        return "Unconfirmed move — check full analysis before acting."
+
     if in_portfolio:
         if direction == "up":
             return "Consider partial profit"
@@ -701,6 +729,9 @@ def send_extreme_move_alert(
 ) -> dict:
     """Build and send an extreme move alert to one trader."""
     message = "⚡ <b>NexTrade Extreme Move Alert</b>\n\n"
+    mover_rows: list[dict[str, Any]] = []
+    confirmed_count = 0
+    counter_count = 0
 
     for m in moves:
         symbol = m["symbol"]
@@ -718,23 +749,72 @@ def send_extreme_move_alert(
         rsi_line = _format_extreme_move_rsi_context(rsi)
         vol_line = _format_extreme_move_volume_context(vp)
         ma_line = _format_extreme_move_ma_context(above_ma50)
+        sustainability = _mover_sustainability(m, tech)
         action_line = _extreme_move_action_guidance(
-            direction, change_pct, in_pf, in_wl, rsi
+            direction, change_pct, in_pf, in_wl, rsi, sustainability
         )
 
-        emoji = "🚀" if direction == "up" else "📉"
-        message += f"{emoji} <b>{symbol}</b>: {change_pct:+.1f}% @ {price}\n"
-        if rsi_line:
-            message += f"   {rsi_line}\n"
-        if vol_line:
-            message += f"   {vol_line}\n"
-        if ma_line:
-            message += f"   {ma_line}\n"
-        message += f"   → {action_line}\n\n"
+        if direction == "down":
+            emoji = "📉"
+            header = f"{symbol}: {change_pct:.1f}% @ {price}"
+        else:
+            if sustainability == "confirmed":
+                emoji = "📈"
+                header = f"{symbol}: +{change_pct:.1f}% @ {price} — move confirmed"
+                confirmed_count += 1
+            elif sustainability == "counter_trend":
+                emoji = "⚠️"
+                header = f"{symbol}: +{change_pct:.1f}% @ {price} — counter-trend spike"
+                counter_count += 1
+            elif sustainability == "distribution":
+                emoji = "🚨"
+                header = f"{symbol}: +{change_pct:.1f}% @ {price} — selling into strength"
+                counter_count += 1
+            else:
+                emoji = "🔔"
+                header = f"{symbol}: +{change_pct:.1f}% @ {price} — unconfirmed move"
+
+        mover_rows.append(
+            {
+                "emoji": emoji,
+                "header": header,
+                "rsi_line": rsi_line,
+                "vol_line": vol_line,
+                "ma_line": ma_line,
+                "action_line": action_line,
+            }
+        )
+
+    if confirmed_count > 0 and counter_count == 0:
+        summary = "✅ Market showing broad strength — moves look sustainable."
+    elif confirmed_count == 0 and counter_count > 0:
+        summary = (
+            "⚠️ Intraday spikes detected — most moves are counter-trend. "
+            "High reversal risk. Do NOT chase."
+        )
+    elif confirmed_count > 0 and counter_count > 0:
+        summary = (
+            f"Mixed signals — {confirmed_count} confirmed, "
+            f"{counter_count} counter-trend. Be selective."
+        )
+    else:
+        summary = "Intraday moves detected — verify before acting."
+
+    message += f"{summary}\n\n"
+    for row in mover_rows:
+        message += f"{row['emoji']} <b>{row['header']}</b>\n"
+        if row["rsi_line"]:
+            message += f"   {row['rsi_line']}\n"
+        if row["vol_line"]:
+            message += f"   {row['vol_line']}\n"
+        if row["ma_line"]:
+            message += f"   {row['ma_line']}\n"
+        message += f"   → {row['action_line']}\n\n"
 
     message += (
-        f"<i>Session {moves[0]['session_no']} | {len(moves)} stocks moved >5%</i>\n\n"
-        "Want full analysis? Ask: 'tell me about SYMBOL'"
+        "\n⏱ <i>Intraday alert — moves can reverse quickly.\n"
+        "Wait for next session close to confirm.\n"
+        "Want full analysis? Ask: 'tell me about SYMBOL'</i>"
     )
 
     return send_telegram_message(chat_id=chat_id, message=message, parse_mode="HTML")

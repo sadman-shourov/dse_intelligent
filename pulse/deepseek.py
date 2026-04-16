@@ -2014,36 +2014,6 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             })
         buy_signals.sort(key=lambda x: x["confidence"], reverse=True)
 
-        # --- Yesterday's top WATCH signals ---
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT DISTINCT ON (symbol)
-                symbol, confidence_score, raw_output
-            FROM analysis_results
-            WHERE analysis_date = %s AND overall_signal = 'WATCH'
-            ORDER BY symbol, confidence_score DESC NULLS LAST
-            LIMIT 5
-            """,
-            (yesterday,),
-        )
-        watch_rows = cur.fetchall()
-        cur.close()
-
-        watch_signals: list[dict] = []
-        for sym, conf, raw in watch_rows:
-            r = raw if isinstance(raw, dict) else {}
-            sr = r.get("sr") or {}
-            cp = _float_or_none(sr.get("current_price")) or _float_or_none(r.get("current_price"))
-            reason = r.get("signal_reason") or ""
-            watch_signals.append({
-                "symbol": sym,
-                "confidence": _float_or_none(conf) or 0.0,
-                "current_price": cp,
-                "reason": reason,
-            })
-        watch_signals.sort(key=lambda x: x["confidence"], reverse=True)
-
         analysis = get_analysis_summary(conn, analysis_date)
 
         # --- Portfolio and watchlist ---
@@ -2093,10 +2063,6 @@ def generate_premarket_briefing(trader_id: int) -> dict:
                 f"Key support: {sup[0] if sup else 'N/A'}"
             )
         lines.append("")
-        lines.append(f"YESTERDAY'S TOP WATCH SIGNALS ({len(watch_signals)}):")
-        for w in watch_signals:
-            lines.append(f"- {w['symbol']} @ {w['current_price']} | {w['reason']}")
-        lines.append("")
         if not portfolio:
             lines.append("TRADER PORTFOLIO: Empty. No open positions.")
         else:
@@ -2112,12 +2078,18 @@ def generate_premarket_briefing(trader_id: int) -> dict:
                     f"  Key support: {sup_str}{at_sl}"
                 )
         lines.append("")
-        lines.append(f"WATCHLIST ({len(watchlist)} stocks):")
-        for w in watchlist:
-            lines.append(
+        if not watchlist:
+            watchlist_lines = ["No watchlist stocks configured yet."]
+            lines.append("WATCHLIST: empty — trader has not set up a watchlist yet.")
+            lines.extend(watchlist_lines)
+        else:
+            watchlist_lines = [
                 f"- {w['symbol']}: target {w.get('target_price')}, "
                 f"signal {w.get('signal')}"
-            )
+                for w in watchlist
+            ]
+            lines.append(f"WATCHLIST ({len(watchlist)} stocks):")
+            lines.extend(watchlist_lines)
 
         user_msg = "\n".join(lines)
 
@@ -2133,7 +2105,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         # --- Format Telegram message (shared header/footer with pulse formatter) ---
         premarket_analysis = {
             "buy_signal_total": int(analysis.get("buy_signal_total") or len(buy_signals)),
-            "watch_signal_total": int(analysis.get("watch_signal_total") or len(watch_signals)),
+            "watch_signal_total": int(analysis.get("watch_signal_total") or 0),
             "exit_signals": analysis.get("exit_signals") or [],
             "total_analysed": int(analysis.get("total_analysed") or 0),
         }
