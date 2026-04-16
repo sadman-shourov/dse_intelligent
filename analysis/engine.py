@@ -2256,29 +2256,48 @@ def detect_extreme_moves(
     live_ticks_map: dict[str, list[dict]],
     threshold_pct: float = 5.0,
 ) -> list[dict]:
-    """Return symbols whose latest-session change_val exceeds threshold_pct."""
+    """Return symbols whose latest-session % change 
+    exceeds threshold_pct."""
     extreme: list[dict] = []
     for symbol, sessions in live_ticks_map.items():
         if not sessions:
             continue
         latest = sessions[-1]
-        change_val = latest.get("change_val")
-        if change_val is None:
+        
+        ltp = latest.get("ltp")
+        ycp = latest.get("ycp")
+        
+        # Calculate real percentage change
+        if ltp is None or ycp is None:
             continue
         try:
-            chg = float(change_val)
+            ltp_f = float(ltp)
+            ycp_f = float(ycp)
         except (TypeError, ValueError):
             continue
-        if abs(chg) >= threshold_pct:
+        
+        if ycp_f == 0:
+            continue
+            
+        change_pct = round((ltp_f - ycp_f) / ycp_f * 100, 2)
+        change_val = round(ltp_f - ycp_f, 2)
+        
+        if abs(change_pct) >= threshold_pct:
             extreme.append({
                 "symbol": symbol,
-                "change_pct": round(chg, 2),
-                "direction": "up" if chg > 0 else "down",
-                "current_price": latest.get("ltp"),
+                "change_pct": change_pct,
+                "change_val": change_val,
+                "direction": "up" if change_pct > 0 else "down",
+                "current_price": ltp_f,
+                "ycp": ycp_f,
                 "session_no": latest.get("session_no"),
                 "volume": latest.get("volume"),
             })
-    return sorted(extreme, key=lambda x: abs(x["change_pct"]), reverse=True)
+    return sorted(
+        extreme, 
+        key=lambda x: abs(x["change_pct"]), 
+        reverse=True
+    )
 
 
 def _compute_session_no() -> int:
