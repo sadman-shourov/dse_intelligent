@@ -2340,30 +2340,30 @@ def detect_forming_setups(
         resistance_levels = row[5] or []
         raw           = row[6] or {}
 
-        # All dynamic fields come from raw_output
-        current_price = float(raw.get("current_price") or 
-                             raw.get("current_ltp") or 0)
+        rsi_data       = raw.get("rsi") or {}
+        rsi_val        = float(rsi_data.get("rsi") or 50)
+        rsi_direction  = (rsi_data.get("rsi_direction") or
+                         raw.get("rsi_direction") or "unknown")
+        averaging_zone = (rsi_data.get("averaging_zone") or
+                         raw.get("averaging_zone") or "neutral")
+
+        vol_data       = raw.get("volume_profile") or {}
+        vp             = (raw.get("volume_price_pattern") or
+                         vol_data.get("volume_price_pattern") or
+                         "unknown")
+
+        ma_data        = raw.get("moving_averages") or {}
+        ma_trend       = (ma_data.get("trend") or
+                         raw.get("ma_trend") or "unknown")
+        above_ma50     = ma_data.get("above_ma50")
+
+        rs_data        = raw.get("relative_strength") or {}
+        rs_signal      = rs_data.get("rs_signal") or "neutral"
+
+        current_price  = float(raw.get("current_price") or
+                              raw.get("current_ltp") or 0)
         if current_price == 0:
             continue
-
-        rsi_data      = raw.get("rsi") or {}
-        rsi_val       = float(rsi_data.get("rsi_value") or 
-                             rsi_data.get("value") or 50)
-        rsi_direction = rsi_data.get("rsi_direction") or                        raw.get("rsi_direction") or "unknown"
-        averaging_zone = rsi_data.get("averaging_zone") or                         raw.get("averaging_zone") or "neutral"
-
-        vol_data      = raw.get("volume_profile") or {}
-        vp            = (raw.get("volume_price_pattern") or
-                        vol_data.get("volume_price_pattern") or
-                        "unknown")
-
-        ma_data       = raw.get("moving_averages") or {}
-        ma_trend      = (ma_data.get("trend") or
-                        raw.get("ma_trend") or "unknown")
-        above_ma50    = ma_data.get("above_ma50")
-
-        rs_data       = raw.get("relative_strength") or {}
-        rs_signal     = rs_data.get("rs_signal") or "neutral"
 
         # ── SCORING ──────────────────────────────────────────
         score = 0
