@@ -897,6 +897,7 @@ def get_stock(symbol: str):
         breakout = False
         analysis_date = None
         class_flags: dict = {}
+        raw: dict = {}
 
         if ar:
             signal = ar[1] or "UNKNOWN"
@@ -945,6 +946,24 @@ def get_stock(symbol: str):
             "is_market_open": market_ctx["is_market_open"],
             "market_status": market_ctx["market_status"],
             "current_time_dhaka": market_ctx["current_time_dhaka"],
+            "ma20": raw.get("moving_averages", {}).get("ma20"),
+            "ma50": raw.get("moving_averages", {}).get("ma50"),
+            "ma200": raw.get("moving_averages", {}).get("ma200"),
+            "above_ma50": raw.get("moving_averages", {}).get("above_ma50"),
+            "above_ma200": raw.get("moving_averages", {}).get("above_ma200"),
+            "ma_trend": raw.get("moving_averages", {}).get("trend"),
+            "rsi_direction": raw.get("rsi_direction")
+            if raw.get("rsi_direction") is not None
+            else (raw.get("rsi") or {}).get("rsi_direction"),
+            "averaging_zone": raw.get("averaging_zone")
+            if raw.get("averaging_zone") is not None
+            else (raw.get("rsi") or {}).get("averaging_zone"),
+            "volume_price_pattern": raw.get("volume_price_pattern")
+            if raw.get("volume_price_pattern") is not None
+            else (raw.get("volume_profile") or {}).get("volume_price_pattern"),
+            "averaging_signal": raw.get("averaging_signal")
+            if raw.get("averaging_signal") is not None
+            else (raw.get("volume_profile") or {}).get("averaging_signal"),
         }
     except Exception as e:
         logger.exception("get_stock error symbol=%s", symbol)

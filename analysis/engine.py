@@ -893,7 +893,15 @@ def calculate_fibonacci(df: pd.DataFrame) -> dict:
 def calculate_rsi(df: pd.DataFrame, period: int = 14) -> dict:
     try:
         if len(df) < period + 1:
-            return {"status": "skipped", "rsi": None, "signal": "neutral", "oversold": False, "overbought": False}
+            return {
+                "status": "skipped",
+                "rsi": None,
+                "signal": "neutral",
+                "oversold": False,
+                "overbought": False,
+                "rsi_direction": "unknown",
+                "averaging_zone": None,
+            }
 
         close = df["close"].astype(float)
         rsi_series = RSIIndicator(close=close, window=period).rsi()
@@ -902,15 +910,57 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> dict:
         overbought = rsi_val > 70
         signal = "oversold" if oversold else "overbought" if overbought else "neutral"
 
+        # RSI direction: is momentum improving or worsening?
+        rsi_direction = "unknown"
+        if len(close) >= period + 4:
+            rsi_series_full = RSIIndicator(
+                close=close, window=period
+            ).rsi().dropna()
+            if len(rsi_series_full) >= 3:
+                rsi_prev2 = float(rsi_series_full.iloc[-3])
+                rsi_prev1 = float(rsi_series_full.iloc[-2])
+                rsi_curr = float(rsi_series_full.iloc[-1])
+
+                if rsi_curr > rsi_prev1 > rsi_prev2:
+                    rsi_direction = "rising"
+                elif rsi_curr < rsi_prev1 < rsi_prev2:
+                    rsi_direction = "falling"
+                elif abs(rsi_curr - rsi_prev1) < 2:
+                    rsi_direction = "stabilizing"
+                else:
+                    rsi_direction = "mixed"
+
+        if rsi_val < 30:
+            averaging_zone = "strong"  # oversold
+        elif rsi_val < 40 and rsi_direction in ("stabilizing", "rising"):
+            averaging_zone = "acceptable"
+        elif rsi_val < 40 and rsi_direction == "falling":
+            averaging_zone = "wait"  # still falling
+        elif rsi_val >= 50:
+            averaging_zone = "avoid"
+        else:
+            averaging_zone = "neutral"
+
         return {
             "status": "ok",
             "rsi": round(rsi_val, 2),
             "signal": signal,
             "oversold": oversold,
             "overbought": overbought,
+            "rsi_direction": rsi_direction,
+            "averaging_zone": averaging_zone,
         }
     except Exception as e:
-        return {"status": "error", "rsi": None, "signal": "neutral", "oversold": False, "overbought": False, "error": str(e)}
+        return {
+            "status": "error",
+            "rsi": None,
+            "signal": "neutral",
+            "oversold": False,
+            "overbought": False,
+            "rsi_direction": "unknown",
+            "averaging_zone": None,
+            "error": str(e),
+        }
 
 
 def calculate_macd(df: pd.DataFrame) -> dict:
@@ -948,7 +998,15 @@ def calculate_macd(df: pd.DataFrame) -> dict:
 def calculate_volume_profile(df: pd.DataFrame) -> dict:
     try:
         if df.empty:
-            return {"status": "skipped", "current_volume": None, "avg_volume_20d": None, "pct_vs_avg": None, "signal": "normal"}
+            return {
+                "status": "skipped",
+                "current_volume": None,
+                "avg_volume_20d": None,
+                "pct_vs_avg": None,
+                "signal": "normal",
+                "volume_price_pattern": "unknown",
+                "averaging_signal": "neutral",
+            }
 
         vol = df["volume"].astype(float)
         curr_vol = float(vol.iloc[-1]) if len(vol) else 0.0
@@ -962,6 +1020,56 @@ def calculate_volume_profile(df: pd.DataFrame) -> dict:
             avg_val20 = float(val_series.tail(20).mean()) if len(val_series) else 0.0
             if avg_val20 > 0 and curr_val > 0:
                 use_value = True
+
+        # Detect volume+price relationship pattern
+        # Requires last 3 sessions of data
+        volume_price_pattern = "unknown"
+        if len(df) >= 3:
+            closes = df["close"].astype(float).tail(3).values
+            vols = df["volume"].astype(float).tail(3).values
+
+            price_falling = closes[-1] < closes[-2] < closes[-3]
+            price_rising = closes[-1] > closes[-2] > closes[-3]
+            price_stable = (
+                abs(closes[-1] - closes[-2]) / closes[-2] < 0.01
+                if closes[-2] != 0
+                else False
+            )
+
+            vol_falling = vols[-1] < vols[-2] * 0.85
+            vol_rising = vols[-1] > vols[-2] * 1.15
+            vol_stable = not vol_falling and not vol_rising
+
+            if price_falling and vol_falling:
+                volume_price_pattern = "sellers_exhausted"
+                # Good for averaging — selling pressure dying
+            elif price_stable and vol_rising:
+                volume_price_pattern = "accumulation"
+                # Strong averaging signal — buyers entering quietly
+            elif price_rising and vol_rising:
+                volume_price_pattern = "bullish_momentum"
+                # Trend continuation — not averaging, this is breakout
+            elif price_falling and vol_rising:
+                volume_price_pattern = "distribution"
+                # DANGER — institutions dumping, do NOT average
+            elif price_falling and vol_stable:
+                volume_price_pattern = "weak_selloff"
+                # Caution — no conviction either way
+            elif price_rising and vol_falling:
+                volume_price_pattern = "weak_rally"
+                # Rally without volume — unsustainable
+            else:
+                volume_price_pattern = "mixed"
+
+        averaging_signal = (
+            "strong"
+            if volume_price_pattern == "accumulation"
+            else "good"
+            if volume_price_pattern == "sellers_exhausted"
+            else "avoid"
+            if volume_price_pattern == "distribution"
+            else "neutral"
+        )
 
         if use_value:
             pct = (curr_val - avg_val20) / avg_val20 * 100 if avg_val20 > 0 else 0.0
@@ -980,6 +1088,8 @@ def calculate_volume_profile(df: pd.DataFrame) -> dict:
                 "pct_vs_avg": round(pct, 2),
                 "signal": sig,
                 "based_on": "value",
+                "volume_price_pattern": volume_price_pattern,
+                "averaging_signal": averaging_signal,
             }
 
         # Fall back to raw volume
@@ -998,9 +1108,88 @@ def calculate_volume_profile(df: pd.DataFrame) -> dict:
             "pct_vs_avg": round(pct, 2),
             "signal": sig,
             "based_on": "volume",
+            "volume_price_pattern": volume_price_pattern,
+            "averaging_signal": averaging_signal,
         }
     except Exception as e:
-        return {"status": "error", "current_volume": None, "avg_volume_20d": None, "pct_vs_avg": None, "signal": "normal", "error": str(e)}
+        return {
+            "status": "error",
+            "current_volume": None,
+            "avg_volume_20d": None,
+            "pct_vs_avg": None,
+            "signal": "normal",
+            "volume_price_pattern": "unknown",
+            "averaging_signal": "neutral",
+            "error": str(e),
+        }
+
+
+def calculate_moving_averages(df: pd.DataFrame) -> dict:
+    try:
+        if len(df) < 20:
+            return {
+                "status": "insufficient_data",
+                "ma20": None, "ma50": None, "ma200": None,
+                "above_ma20": None, "above_ma50": None,
+                "above_ma200": None,
+                "price_vs_ma20_pct": None,
+                "price_vs_ma50_pct": None,
+                "price_vs_ma200_pct": None,
+                "trend": "unknown"
+            }
+
+        close = df["close"].astype(float)
+        current = float(close.iloc[-1])
+
+        ma20 = round(float(close.tail(20).mean()), 2)
+        ma50 = round(float(close.tail(50).mean()), 2) if len(df) >= 50 else None
+        ma200 = round(float(close.tail(200).mean()), 2) if len(df) >= 200 else None
+
+        above_ma20 = current > ma20 if ma20 else None
+        above_ma50 = current > ma50 if ma50 else None
+        above_ma200 = current > ma200 if ma200 else None
+
+        pct_vs_ma20 = round((current - ma20) / ma20 * 100, 2) if ma20 else None
+        pct_vs_ma50 = round((current - ma50) / ma50 * 100, 2) if ma50 else None
+        pct_vs_ma200 = round((current - ma200) / ma200 * 100, 2) if ma200 else None
+
+        # Trend assessment
+        if ma50 and ma200:
+            if current > ma50 and current > ma200:
+                trend = "strong_uptrend"
+            elif current > ma50 and current < ma200:
+                trend = "recovering"
+            elif current < ma50 and current > ma200:
+                trend = "pullback_in_uptrend"
+            elif current < ma50 and current < ma200:
+                trend = "downtrend"
+            else:
+                trend = "neutral"
+        elif ma50:
+            if current > ma50:
+                trend = "above_ma50"
+            else:
+                trend = "below_ma50"
+        else:
+            trend = "insufficient_data"
+
+        return {
+            "status": "ok",
+            "ma20": ma20,
+            "ma50": ma50,
+            "ma200": ma200,
+            "above_ma20": above_ma20,
+            "above_ma50": above_ma50,
+            "above_ma200": above_ma200,
+            "price_vs_ma20_pct": pct_vs_ma20,
+            "price_vs_ma50_pct": pct_vs_ma50,
+            "price_vs_ma200_pct": pct_vs_ma200,
+            "trend": trend
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e),
+                "ma20": None, "ma50": None, "ma200": None,
+                "trend": "unknown"}
 
 
 def is_mutual_fund(symbol: str) -> bool:
@@ -1758,6 +1947,7 @@ def analyse_symbol(
         rsi = calculate_rsi(df)
         macd = calculate_macd(df)
         volume = calculate_volume_profile(df)
+        moving_averages = calculate_moving_averages(df)
 
         # New signals
         intraday = calculate_intraday_momentum(intraday_df)
@@ -1852,6 +2042,12 @@ def analyse_symbol(
             },
             "volume_signal": volume.get("signal"),
             "stock_class": stock_class,
+            "ma20": moving_averages.get("ma20"),
+            "ma50": moving_averages.get("ma50"),
+            "ma200": moving_averages.get("ma200"),
+            "above_ma50": moving_averages.get("above_ma50"),
+            "above_ma200": moving_averages.get("above_ma200"),
+            "ma_trend": moving_averages.get("trend"),
             "overall_signal": signal,
             "confidence_score": confidence,
             "raw_output": {
@@ -1865,6 +2061,8 @@ def analyse_symbol(
                 "breakout": breakout,
                 "fib": fib,
                 "rsi": rsi,
+                "rsi_direction": rsi.get("rsi_direction"),
+                "averaging_zone": rsi.get("averaging_zone"),
                 "macd": macd,
                 "volume": volume,
                 "pe_ratio": pe,
@@ -1874,6 +2072,9 @@ def analyse_symbol(
                 "intraday_momentum": intraday,
                 "relative_strength": rs,
                 "volume_profile": volume,
+                "volume_price_pattern": volume.get("volume_price_pattern"),
+                "averaging_signal": volume.get("averaging_signal"),
+                "moving_averages": moving_averages,
                 "signal_reason": reason,
                 "market_trend": market_trend or {},
                 "trade_setup": trade_setup,
