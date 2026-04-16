@@ -2314,7 +2314,7 @@ def detect_forming_setups(
         SELECT 
             ar.symbol,
             ar.overall_signal,
-            ar.confidence,
+            ar.confidence_score,
             ar.rsi,
             ar.current_price,
             ar.stock_class,
@@ -2322,7 +2322,7 @@ def detect_forming_setups(
         FROM analysis_results ar
         WHERE ar.analysis_date = %s
           AND ar.overall_signal = 'WATCH'
-          AND ar.confidence >= 0.55
+          AND ar.confidence_score >= 0.55
           AND ar.stock_class != 'GAMBLING'
         ORDER BY ar.confidence DESC
     """, (target_date,))
