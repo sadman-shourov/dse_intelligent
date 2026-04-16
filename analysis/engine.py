@@ -2300,6 +2300,193 @@ def detect_extreme_moves(
     )
 
 
+def detect_forming_setups(
+    conn,
+    target_date,
+    session_no: int = 0,
+) -> list[dict]:
+    """
+    Find stocks 1-2 sessions away from a confirmed BUY.
+    Scores each WATCH stock 0-8 and returns top 10 with score >= 4.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+            ar.symbol,
+            ar.overall_signal,
+            ar.confidence,
+            ar.rsi,
+            ar.current_price,
+            ar.stock_class,
+            ar.raw_output
+        FROM analysis_results ar
+        WHERE ar.analysis_date = %s
+          AND ar.overall_signal = 'WATCH'
+          AND ar.confidence >= 0.55
+          AND ar.stock_class != 'GAMBLING'
+        ORDER BY ar.confidence DESC
+    """, (target_date,))
+    rows = cur.fetchall()
+    cur.close()
+
+    results = []
+
+    for row in rows:
+        symbol = row[0]
+        signal = row[1]
+        confidence = float(row[2] or 0)
+        rsi_val = float(row[3] or 50)
+        current_price = float(row[4] or 0)
+        stock_class = row[5]
+        raw = row[6] or {}
+
+        # Extract nested fields
+        support_levels = raw.get("support_levels") or []
+        resistance_levels = raw.get("resistance_levels") or []
+        rsi_direction = raw.get("rsi_direction") or "unknown"
+        averaging_zone = raw.get("averaging_zone") or "neutral"
+        vp = raw.get("volume_price_pattern") or "unknown"
+        ma_data = raw.get("moving_averages") or {}
+        ma_trend = ma_data.get("trend") or raw.get("ma_trend") or "unknown"
+        above_ma50 = ma_data.get("above_ma50")
+        rs_data = raw.get("relative_strength") or {}
+        rs_signal = rs_data.get("rs_signal") or "neutral"
+
+        # ── SCORING ──────────────────────────────────────────
+        score = 0
+        missing = []
+        bonuses = 0
+
+        # 1. SUPPORT — primary non-negotiable (max 3 pts)
+        nearest_support = None
+        distance_to_support_pct = None
+        support_score = 0
+
+        if support_levels:
+            valid = [s for s in support_levels 
+                    if isinstance(s, (int, float)) and float(s) < current_price]
+            if valid:
+                nearest_support = max(valid)
+                distance_to_support_pct = round(
+                    (current_price - nearest_support) / nearest_support * 100, 2
+                )
+                if distance_to_support_pct <= 3.0:
+                    support_score = 2
+                    score += 2
+                    if distance_to_support_pct <= 1.0:
+                        score += 1  # bonus for being very close
+                        bonuses += 1
+                else:
+                    missing.append("Price not close enough to support")
+            else:
+                missing.append("No support level below current price")
+        else:
+            missing.append("No support levels calculated")
+
+        # 2. RSI TIMING (max 2 pts)
+        rsi_score = 0
+        if rsi_val < 35:
+            rsi_score = 2
+            score += 2
+        elif rsi_val < 45 and rsi_direction in ("stabilizing", "rising"):
+            rsi_score = 1
+            score += 1
+        elif rsi_val < 45 and rsi_direction == "falling":
+            missing.append("RSI still falling — wait")
+        elif rsi_val >= 45:
+            missing.append("RSI not in entry zone (need <45)")
+
+        # 3. VOLUME PATTERN (max 1 pt)
+        vol_score = 0
+        if vp in ("sellers_exhausted", "accumulation"):
+            vol_score = 1
+            score += 1
+        elif vp == "distribution":
+            # Hard disqualifier
+            continue
+        else:
+            missing.append("Volume confirmation needed")
+
+        # 4. MA TREND FILTER (max 1 pt)
+        ma_score = 0
+        if ma_trend in ("strong_uptrend", "pullback_in_uptrend", "recovering"):
+            ma_score = 1
+            score += 1
+        elif ma_trend == "downtrend":
+            missing.append("MA trend is downtrend — risky")
+        elif ma_trend in ("below_ma50", "unknown"):
+            missing.append("Below MA50 — trend against entry")
+        else:
+            ma_score = 1
+            score += 1
+
+        # 5. STOCK CLASS (max 1 pt)
+        if stock_class == "INVESTMENT":
+            score += 1
+        elif stock_class == "TRADING":
+            score += 1
+        # GAMBLING already excluded by query
+
+        # 6. RELATIVE STRENGTH (max 1 pt)
+        if rs_signal in ("outperforming", "inline"):
+            score += 1
+        else:
+            missing.append("Underperforming DSEX")
+
+        # ── MINIMUM THRESHOLD ────────────────────────────────
+        if score < 4:
+            continue
+
+        # ── SETUP TYPE ───────────────────────────────────────
+        if vp == "accumulation" and nearest_support and distance_to_support_pct <= 2:
+            setup_type = "ACCUMULATION"
+        elif rsi_val < 32:
+            setup_type = "OVERSOLD_RECOVERY"
+        elif nearest_support and distance_to_support_pct <= 1.5:
+            setup_type = "SUPPORT_BOUNCE"
+        elif above_ma50 is False and ma_trend == "recovering":
+            setup_type = "MA_TEST"
+        else:
+            setup_type = "SUPPORT_BOUNCE"
+
+        # ── FIRST TARGET ─────────────────────────────────────
+        first_target = None
+        if resistance_levels:
+            valid_res = [r for r in resistance_levels 
+                        if isinstance(r, (int, float)) 
+                        and float(r) > current_price]
+            if valid_res:
+                first_target = min(valid_res)
+
+        results.append({
+            "symbol": symbol,
+            "current_price": current_price,
+            "score": score,
+            "max_score": 8,
+            "confidence_pct": round(score / 8 * 100),
+            "signal": signal,
+            "stock_class": stock_class,
+            "nearest_support": nearest_support,
+            "distance_to_support_pct": distance_to_support_pct,
+            "first_target": first_target,
+            "rsi": round(rsi_val, 2),
+            "rsi_direction": rsi_direction,
+            "averaging_zone": averaging_zone,
+            "volume_pattern": vp,
+            "ma_trend": ma_trend,
+            "above_ma50": above_ma50,
+            "rs_signal": rs_signal,
+            "setup_type": setup_type,
+            "missing": missing,
+            "session_no": session_no,
+        })
+
+    # Sort by score DESC, then distance to support ASC
+    results.sort(key=lambda x: (-x["score"], 
+                                 x.get("distance_to_support_pct") or 99))
+    return results[:10]
+
+
 def _compute_session_no() -> int:
     """Return session 1-10 during market hours, 0 outside."""
     import pytz

@@ -646,6 +646,43 @@ def signals_today():
             conn.close()
 
 
+@app.get("/signals/forming")
+def get_forming_setups():
+    """Get stocks forming up for a BUY signal."""
+    conn = _get_conn()
+    try:
+        from analysis.engine import detect_forming_setups
+        import pytz
+        from datetime import datetime as dt
+        dhaka = pytz.timezone("Asia/Dhaka")
+        now = dt.now(dhaka)
+        session_no = 0
+        if now.weekday() in [0, 1, 2, 3, 6]:
+            market_open = now.replace(
+                hour=10, minute=15, second=0, microsecond=0
+            )
+            market_close = now.replace(
+                hour=14, minute=30, second=0, microsecond=0
+            )
+            if market_open <= now <= market_close:
+                elapsed = int(
+                    (now - market_open).total_seconds() / 60
+                )
+                session_no = elapsed // 10 + 1
+
+        today = _get_db_date(conn)
+        setups = detect_forming_setups(conn, today, session_no)
+        return {
+            "status": "ok",
+            "date": today.isoformat(),
+            "session_no": session_no,
+            "count": len(setups),
+            "forming_setups": setups,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Pulse endpoints
 # ---------------------------------------------------------------------------

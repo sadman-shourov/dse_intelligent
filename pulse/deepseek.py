@@ -1195,6 +1195,42 @@ def should_send_pulse(
     if session_no == 1:
         return True, "first_session", meta
 
+    # ── FORMING SETUPS CHECK ─────────────────────────────
+    if session_no is not None and session_no > 2:
+        try:
+            from analysis.engine import detect_forming_setups
+            current_setups = detect_forming_setups(
+                conn, target_date, session_no
+            )
+            prev_setups = detect_forming_setups(
+                conn, target_date, max(0, session_no - 1)
+            )
+            current_high = {
+                s["symbol"] for s in current_setups 
+                if s["score"] >= 5
+            }
+            prev_high = {
+                s["symbol"] for s in prev_setups 
+                if s["score"] >= 5
+            }
+            new_forming = [
+                s for s in current_setups
+                if s["symbol"] not in prev_high 
+                and s["score"] >= 5
+            ]
+            improved = [
+                s for s in current_setups
+                if s["symbol"] in prev_high 
+                and s["score"] >= 6
+            ]
+            if new_forming or improved:
+                meta["forming_setups"] = current_setups
+                meta["new_forming"] = new_forming
+                meta["improved_setups"] = improved
+                return True, "setup_forming", meta
+        except Exception as e:
+            logger.warning("forming setups check failed: %s", e)
+
     # Check: periodic market update even when quiet
     if session_no is not None and session_no > 0:
         if session_no % 3 == 0:
@@ -1476,6 +1512,57 @@ def build_proactive_pulse(
             f"vs yesterday. Watching for opportunities.\n"
         )
 
+    elif send_reason == "setup_forming":
+        new_setups = meta.get("new_forming", [])
+        improved = meta.get("improved_setups", [])
+        all_setups = (new_setups + improved)[:3]
+
+        setup_lines = []
+        for s in all_setups:
+            target_str = (
+                f"Target: {s['first_target']}" 
+                if s.get("first_target") 
+                else "Target: calculating"
+            )
+            support_str = (
+                f"Support: {s['nearest_support']} "
+                f"({s['distance_to_support_pct']}% away)"
+                if s.get("nearest_support")
+                else "Support: none confirmed"
+            )
+            missing_str = (
+                ", ".join(s["missing"]) 
+                if s.get("missing") 
+                else "all conditions near confirmation"
+            )
+            setup_lines.append(
+                f"{s['symbol']} @ {s['current_price']}"
+                f" | Score {s['score']}/8 "
+                f"({s['confidence_pct']}%)\n"
+                f"Setup: {s['setup_type']}\n"
+                f"{support_str}\n"
+                f"{target_str}\n"
+                f"RSI: {s['rsi']} ({s['rsi_direction']})\n"
+                f"Volume: {s['volume_pattern']}\n"
+                f"MA trend: {s['ma_trend']}\n"
+                f"Still needs: {missing_str}"
+            )
+
+        setups_block = "\n\n".join(setup_lines) or "None identified."
+
+        user_msg = (
+            f"SETUP FORMING ALERT\n"
+            f"Session: {session_no}\n"
+            f"Date: {target_date}\n"
+            f"DSEX: {dsex_str} ({ch_str})\n\n"
+            f"SETUPS BUILDING — NOT BUY SIGNALS YET:\n\n"
+            f"{setups_block}\n\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"These are pre-signals. Watch for confirmation "
+            f"next session. If conditions complete, a BUY "
+            f"signal will fire."
+        )
+
     else:
         user_msg = (
             f"SESSION {session_no} — {target_date.isoformat()}\n"
@@ -1562,6 +1649,7 @@ def format_telegram_message(
     headers = {
         "new_trade_setup": "🚨 NexTrade — Live Trade Alert",
         "setup_confirmed": "⚡ NexTrade — Setup Confirmed",
+        "setup_forming": "🔭 NexTrade — Setup Forming",
         "portfolio_stop_loss_alert": "⚠️ NexTrade — Position Alert",
         "portfolio_target_hit": "💰 NexTrade — Target Hit",
         "market_significant_move": "📊 NexTrade — Market Alert",
