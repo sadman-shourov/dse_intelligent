@@ -56,8 +56,10 @@ For each position show:
 - Clear action: hold / exit on bounce / exit now
 
 MARKET CONTEXT:
-- Always state DSEX with date: "DSEX closed at X on [date]"
-- State market trend: "market in uptrend / consolidation / downtrend"
+- DSEX: Only mention if explicitly provided in the data below.
+  If not provided or marked "not available", do NOT mention 
+  DSEX at all — not even approximately or historically.
+- State market trend only if data supports it
 - State session context: "Session X — [what this means]"
 
 TONE:
@@ -1092,9 +1094,29 @@ def should_send_pulse(
             pnl = float(p.get("pnl_pct") or 0.0)
             if pnl <= -7.5:
                 meta.update({"symbol": sym, "pnl_pct": pnl, "current_price": p.get("current_price")})
-                tgt, stp = _trader_intent_targets(cur, trader_id, sym)
-                meta["stop_price"] = stp
-                return True, "portfolio_stop_loss_alert", meta
+                # Only fire stop loss alert once per 3 sessions
+                # to avoid spamming the same message repeatedly
+                cur_sl = conn.cursor()
+                cur_sl.execute("""
+                    SELECT MAX(session_no) FROM pulse_log
+                    WHERE trader_id = %s
+                      AND pulse_date = %s
+                      AND deepseek_input::text LIKE '%portfolio_stop_loss_alert%'
+                      AND telegram_sent = TRUE
+                """, (trader_id, target_date))
+                last_sl_session = cur_sl.fetchone()
+                cur_sl.close()
+                last_sl = int(last_sl_session[0]) if last_sl_session and last_sl_session[0] else 0
+                
+                # Fire immediately if never sent today
+                # After that, only re-fire every 3 sessions
+                if last_sl > 0 and (session_no - last_sl) < 3:
+                    # Skip — too soon since last stop loss alert
+                    pass
+                else:
+                    tgt, stp = _trader_intent_targets(cur, trader_id, sym)
+                    meta["stop_price"] = stp
+                    return True, "portfolio_stop_loss_alert", meta
 
             sig = _latest_overall_signal(conn, sym, target_date)
             if sig == "EXIT":
@@ -1466,13 +1488,111 @@ def build_proactive_pulse(
 
     elif send_reason == "portfolio_stop_loss_alert":
         sym = meta.get("symbol", "")
+
+        # Fetch analysis data for all portfolio positions
+        analysis_by_symbol = {}
+        if portfolio:
+            symbols = [p['symbol'] for p in portfolio]
+            cur_a = conn.cursor()
+            cur_a.execute("""
+                SELECT DISTINCT ON (symbol)
+                    symbol,
+                    rsi,
+                    raw_output->>'volume_price_pattern' as vp,
+                    raw_output->'moving_averages'->>'trend' as ma_trend,
+                    raw_output->'moving_averages'->>'above_ma50' as above_ma50,
+                    raw_output->>'rsi_direction' as rsi_dir,
+                    support_levels,
+                    resistance_levels
+                FROM analysis_results
+                WHERE symbol = ANY(%s)
+                  AND analysis_date = %s
+                ORDER BY symbol, session_no DESC NULLS LAST, id DESC
+            """, (symbols, target_date))
+            for row in cur_a.fetchall():
+                analysis_by_symbol[row[0]] = {
+                    'rsi': float(row[1]) if row[1] else None,
+                    'vp': row[2] or 'unknown',
+                    'ma_trend': row[3] or 'unknown',
+                    'above_ma50': row[4],
+                    'rsi_dir': row[5] or 'unknown',
+                    'support': row[6] or [],
+                    'resistance': row[7] or []
+                }
+            cur_a.close()
+
+        # Build critical positions block
+        critical_lines = []
+        for p in portfolio:
+            sym = p['symbol']
+            pnl = float(p.get('pnl_pct') or 0)
+            price = p.get('current_price')
+            ar = analysis_by_symbol.get(sym, {})
+            rsi = ar.get('rsi')
+            vp = ar.get('vp', 'unknown')
+            ma_trend = ar.get('ma_trend', 'unknown')
+            rsi_dir = ar.get('rsi_dir', 'unknown')
+            sup = ar.get('support', [])
+            sup_str = str(sup[0]) if sup else 'none'
+            
+            vp_note = {
+                'distribution': 'DISTRIBUTION — institutions selling',
+                'sellers_exhausted': 'sellers exhausting — possible stabilization',
+                'accumulation': 'accumulation — buyers stepping in',
+                'weak_rally': 'weak rally — no conviction',
+                'mixed': 'mixed — unclear'
+            }.get(vp, vp)
+            
+            if pnl <= -10:
+                action = 'EXIT NOW'
+            elif pnl <= -8:
+                action = 'EXIT ON NEXT BOUNCE'
+            elif pnl <= -7.5:
+                action = 'AT STOP LOSS ZONE — decide now'
+            else:
+                action = 'HOLD — watch key levels'
+            
+            rsi_str = f"{rsi:.1f} ({rsi_dir})" if rsi else 'n/a'
+            
+            critical_lines.append(
+                f"{sym}: {pnl:+.1f}% @ {price}\n"
+                f"  RSI: {rsi_str}\n"
+                f"  Volume: {vp_note}\n"
+                f"  MA trend: {ma_trend}\n"
+                f"  Support: {sup_str}\n"
+                f"  Action: {action}"
+            )
+        
+        critical_block = "\n\n".join(critical_lines)
+        
+        # Count how many times stop loss alert fired today
+        cur_c = conn.cursor()
+        cur_c.execute("""
+            SELECT COUNT(*) FROM pulse_log
+            WHERE trader_id = %s
+              AND pulse_date = %s
+              AND deepseek_input::text LIKE '%portfolio_stop_loss_alert%'
+              AND telegram_sent = TRUE
+        """, (trader_id, target_date))
+        alert_count = int((cur_c.fetchone() or [0])[0] or 0)
+        cur_c.close()
+        
+        if alert_count == 0:
+            urgency = "POSITION ALERT"
+        elif alert_count == 1:
+            urgency = "SECOND ALERT — Still holding?"
+        elif alert_count == 2:
+            urgency = "THIRD ALERT — Loss compounding"
+        else:
+            urgency = f"ALERT #{alert_count + 1} — URGENT ACTION NEEDED"
+
         user_msg = (
-            f"POSITION ALERT — {sym}\n\n"
-            f"{sym} approaching your stop loss.\n"
-            f"Current: {meta.get('current_price', '')} | Your stop: {meta.get('stop_price', '')}\n"
-            f"You are down {float(meta.get('pnl_pct') or 0):.1f}% on this position.\n\n"
-            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
-            f"Action required: Review {sym} immediately.\n"
+            f"{urgency}\n"
+            f"Session: {session_no} | Date: {target_date}\n"
+            f"{dsex_context_line}\n\n"
+            f"PORTFOLIO POSITIONS:\n\n"
+            f"{critical_block}\n\n"
+            f"Stop loss rule: Exit any position beyond -8%. No exceptions.\n"
         )
 
     elif send_reason == "portfolio_target_hit":
