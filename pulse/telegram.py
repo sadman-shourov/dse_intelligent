@@ -581,8 +581,119 @@ def mark_symbols_alerted(conn, moves: list[dict], target_date: date) -> None:
         cur.close()
 
 
+def _parse_above_ma50_flag(val: Any) -> bool | None:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in ("true", "t", "1", "yes"):
+        return True
+    if s in ("false", "f", "0", "no"):
+        return False
+    return None
+
+
+def fetch_extreme_move_analysis(conn, symbol: str) -> dict[str, Any]:
+    """Latest session analysis for today (RSI, volume pattern, MA50 context)."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT rsi,
+                   raw_output->>'volume_price_pattern' AS vp,
+                   raw_output->'moving_averages'->>'above_ma50' AS above_ma50
+            FROM analysis_results
+            WHERE symbol = %s AND analysis_date = CURRENT_DATE
+            ORDER BY session_no DESC NULLS LAST
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"rsi": None, "volume_pattern": None, "above_ma50": None}
+        rsi_raw, vp, am = row
+        rsi_f: float | None
+        if rsi_raw is None:
+            rsi_f = None
+        else:
+            try:
+                rsi_f = float(rsi_raw)
+            except (TypeError, ValueError):
+                rsi_f = None
+        vp_norm = (vp or "").strip().lower() or None
+        return {
+            "rsi": rsi_f,
+            "volume_pattern": vp_norm,
+            "above_ma50": _parse_above_ma50_flag(am),
+        }
+    finally:
+        cur.close()
+
+
+def _format_extreme_move_rsi_context(rsi: float | None) -> str | None:
+    if rsi is None:
+        return None
+    if rsi > 70:
+        return (
+            f"⚠️ RSI overbought at {rsi:.0f} — "
+            "move may be overextended, don't chase"
+        )
+    if rsi >= 50:
+        return f"RSI at {rsi:.0f} — momentum ok, watch for continuation"
+    return f"RSI at {rsi:.0f} — still has room to run"
+
+
+def _format_extreme_move_volume_context(vp: str | None) -> str | None:
+    if not vp:
+        return None
+    if vp in ("accumulation", "bullish_momentum"):
+        return "Volume confirms the move — buyers in control"
+    if vp == "distribution":
+        return "⚠️ Volume pattern shows selling into strength — be careful"
+    if vp == "weak_rally":
+        return "Volume not confirming — move may not sustain"
+    return None
+
+
+def _format_extreme_move_ma_context(above_ma50: bool | None) -> str | None:
+    if above_ma50 is True:
+        return "Above MA50 — trend supportive"
+    if above_ma50 is False:
+        return "Below MA50 — counter-trend move, higher risk"
+    return None
+
+
+def _extreme_move_action_guidance(
+    direction: str | None,
+    change_pct: float,
+    in_portfolio: bool,
+    in_watchlist: bool,
+    rsi: float | None,
+) -> str:
+    if in_portfolio:
+        if direction == "up":
+            return "Consider partial profit"
+        if direction == "down":
+            return "Review stop loss"
+        return "Monitor this holding closely for follow-through."
+    if in_watchlist:
+        return "Setup activating — check signal"
+    if rsi is not None:
+        if rsi > 70:
+            return "Too late to chase — wait for pullback"
+        if rsi < 60:
+            return "On radar — check full analysis before entering"
+        return "Momentum elevated — check full analysis before entering"
+    if direction == "up" and change_pct > 15:
+        return "Too late to chase — wait for pullback"
+    if direction == "down":
+        return "Volatile to the downside — check full analysis before acting"
+    return "Check full analysis before acting."
+
+
 def send_extreme_move_alert(
-    trader_id: int,
+    conn,
+    _trader_id: int,
     chat_id: str,
     moves: list[dict],
     portfolio_symbols: set[str],
@@ -596,52 +707,34 @@ def send_extreme_move_alert(
         direction = m.get("direction")
         change_pct = float(m.get("change_pct") or 0.0)
         price = m.get("current_price")
+        tech = fetch_extreme_move_analysis(conn, symbol)
+        rsi = tech.get("rsi")
+        vp = tech.get("volume_pattern")
+        above_ma50 = tech.get("above_ma50")
 
-        if symbol in portfolio_symbols:
-            if direction == "up" and change_pct > 5:
-                action_line = (
-                    "Consider taking partial profit. "
-                    f"You're up {change_pct:.1f}% on this position."
-                )
-            elif direction == "down" and abs(change_pct) > 5:
-                action_line = (
-                    "⚠️ Review stop loss. "
-                    f"Down {abs(change_pct):.1f}% on your position."
-                )
-            else:
-                action_line = "Monitor this holding closely for follow-through."
-        elif symbol in watchlist_symbols and direction == "up":
-            action_line = (
-                "This was on your watchlist — "
-                "it's moving. Check if setup is still valid."
-            )
-        else:
-            if direction == "up" and change_pct > 15:
-                action_line = (
-                    "Already moved significantly. "
-                    "Too late to chase — watch for pullback."
-                )
-            elif direction == "up" and 5 <= change_pct <= 15:
-                action_line = (
-                    "Breaking out. "
-                    "Check if it's on your radar."
-                )
-            else:
-                action_line = (
-                    "Selling pressure — "
-                    "avoid unless you have specific reason."
-                )
+        in_pf = symbol in portfolio_symbols
+        in_wl = symbol in watchlist_symbols
 
-        emoji = "🚀" if direction == "up" else "📉"
-        message += (
-            f"{emoji} {symbol}: {change_pct:+.1f}% @ {price}\n"
-            f"   → {action_line}\n"
+        rsi_line = _format_extreme_move_rsi_context(rsi)
+        vol_line = _format_extreme_move_volume_context(vp)
+        ma_line = _format_extreme_move_ma_context(above_ma50)
+        action_line = _extreme_move_action_guidance(
+            direction, change_pct, in_pf, in_wl, rsi
         )
 
+        emoji = "🚀" if direction == "up" else "📉"
+        message += f"{emoji} <b>{symbol}</b>: {change_pct:+.1f}% @ {price}\n"
+        if rsi_line:
+            message += f"   {rsi_line}\n"
+        if vol_line:
+            message += f"   {vol_line}\n"
+        if ma_line:
+            message += f"   {ma_line}\n"
+        message += f"   → {action_line}\n\n"
+
     message += (
-        f"\n<i>Session {moves[0]['session_no']} | {len(moves)} stocks moved >5%</i>"
-        "\n\nWant analysis on any of these?\n"
-        "Just ask: 'tell me about SYMBOL'"
+        f"<i>Session {moves[0]['session_no']} | {len(moves)} stocks moved >5%</i>\n\n"
+        "Want full analysis? Ask: 'tell me about SYMBOL'"
     )
 
     return send_telegram_message(chat_id=chat_id, message=message, parse_mode="HTML")
@@ -712,6 +805,7 @@ def deliver_extreme_move_alerts(moves: list[dict]) -> dict:
 
             try:
                 res = send_extreme_move_alert(
+                    conn,
                     tid,
                     chat,
                     new_moves,
