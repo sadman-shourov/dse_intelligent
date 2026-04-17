@@ -1104,9 +1104,14 @@ def should_send_pulse(
                       AND deepseek_input::text LIKE '%portfolio_stop_loss_alert%'
                       AND telegram_sent = TRUE
                 """, (trader_id, target_date))
-                last_sl_session = cur_sl.fetchone()
+                row_sl = cur_sl.fetchone()
                 cur_sl.close()
-                last_sl = int(last_sl_session[0]) if last_sl_session and last_sl_session[0] else 0
+                last_sl = 0
+                if row_sl and row_sl[0] is not None:
+                    try:
+                        last_sl = int(row_sl[0])
+                    except (TypeError, ValueError):
+                        last_sl = 0
                 
                 # Fire immediately if never sent today
                 # After that, only re-fire every 3 sessions
