@@ -1096,22 +1096,24 @@ def should_send_pulse(
                 meta.update({"symbol": sym, "pnl_pct": pnl, "current_price": p.get("current_price")})
                 # Only fire stop loss alert once per 3 sessions
                 # to avoid spamming the same message repeatedly
-                cur_sl = conn.cursor()
-                cur_sl.execute("""
-                    SELECT MAX(session_no) FROM pulse_log
-                    WHERE trader_id = %s
-                      AND pulse_date = %s
-                      AND deepseek_input::text LIKE '%portfolio_stop_loss_alert%'
-                      AND telegram_sent = TRUE
-                """, (trader_id, target_date))
-                row_sl = cur_sl.fetchone()
-                cur_sl.close()
                 last_sl = 0
-                if row_sl and row_sl[0] is not None:
-                    try:
+                try:
+                    cur_sl = conn.cursor()
+                    cur_sl.execute("""
+                        SELECT MAX(session_no) FROM pulse_log
+                        WHERE trader_id = %s
+                          AND pulse_date = %s
+                          AND deepseek_input::text 
+                              LIKE '%%portfolio_stop_loss_alert%%'
+                          AND telegram_sent = TRUE
+                    """, (trader_id, target_date))
+                    row_sl = cur_sl.fetchone()
+                    cur_sl.close()
+                    if row_sl and row_sl[0] is not None:
                         last_sl = int(row_sl[0])
-                    except (TypeError, ValueError):
-                        last_sl = 0
+                except Exception as sl_err:
+                    logger.warning("stop loss dedup query failed: %s", sl_err)
+                    last_sl = 0
                 
                 # Fire immediately if never sent today
                 # After that, only re-fire every 3 sessions
@@ -1877,6 +1879,9 @@ def format_telegram_message(
 def _current_session_no_dhaka() -> int:
     tz = pytz.timezone("Asia/Dhaka")
     now_dhaka = datetime.now(tz)
+    # DSE trades Sun-Thu only
+    if now_dhaka.weekday() not in (6, 0, 1, 2, 3):
+        return 0
     market_open = time(10, 15)
     market_close = time(14, 45)
     t = now_dhaka.time()
