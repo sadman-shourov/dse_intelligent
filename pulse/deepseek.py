@@ -2313,7 +2313,12 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         # --- Build prompts ---
         lines: list[str] = []
         lines.append(f"PRE-MARKET BRIEFING — {target_date.isoformat()}")
-        lines.append("Market opens at 10:15am (Asia/Dhaka).")
+        dhaka = pytz.timezone("Asia/Dhaka")
+        now_dhaka = datetime.now(dhaka)
+        if now_dhaka.weekday() in (4, 5):
+            lines.append("Market CLOSED today. Next open: Sunday 10:15am.")
+        else:
+            lines.append("Market opens today at 10:15am (Asia/Dhaka).")
         lines.append("")
         lines.append("YESTERDAY'S MARKET:")
         if dsex is not None:
@@ -2343,11 +2348,20 @@ def generate_premarket_briefing(trader_id: int) -> dict:
                 sym = p["symbol"]
                 sup = support_by_sym.get(sym, [])
                 sup_str = str(sup[0]) if sup else "N/A"
-                at_sl = " — at stop-loss threshold; review at open" if (p.get("pnl_pct") or 0) <= -8 else ""
+                stop_loss_price = round(float(p['avg_buy_price']) * 0.92, 2)
+                pnl = float(p.get('pnl_pct') or 0)
+                if pnl <= -10:
+                    at_sl = f" — PAST STOP. Exit price was {stop_loss_price}. EXIT AT OPEN."
+                elif pnl <= -8:
+                    at_sl = f" — AT STOP LOSS ({stop_loss_price}). Exit at open."
+                elif pnl <= -6:
+                    at_sl = f" — approaching stop ({stop_loss_price}). Watch closely."
+                else:
+                    at_sl = ""
                 lines.append(
                     f"- {sym}: {p['quantity']} shares @ avg {p['avg_buy_price']}\n"
-                    f"  Current: {p['current_price']} | P&L: {p.get('pnl_pct', 0):+.1f}%\n"
-                    f"  Key support: {sup_str}{at_sl}"
+                    f"  Current: {p['current_price']} | P&L: {pnl:+.1f}%\n"
+                    f"  Stop loss: {stop_loss_price} | Support: {sup_str}{at_sl}"
                 )
         lines.append("")
         if not watchlist:
