@@ -127,6 +127,21 @@ def serialize_response(data: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=_jsonify(data))
 
 
+from pydantic import BaseModel
+
+class WatchlistAddRequest(BaseModel):
+    trader_id: int
+    symbol: str
+    target_price: float | None = None
+
+@app.post("/watchlist/add")
+def add_to_watchlist_flat(req: WatchlistAddRequest):
+    conn = _get_conn()
+    try:
+        return _add_to_watchlist(conn, req.trader_id, req.symbol, req.target_price)
+    finally:
+        conn.close()
+
 # ---------------------------------------------------------------------------
 # Existing job runner
 # ---------------------------------------------------------------------------
@@ -2112,6 +2127,35 @@ def get_trader_by_telegram(telegram_chat_id: str):
             conn.close()
 
 
+def _add_to_watchlist(conn, trader_id: int, symbol: str, target_price: float | None = None, notes: str = ""):
+    symbol = symbol.upper().strip()
+    if not symbol:
+        return JSONResponse(status_code=400, content={"error": "symbol is required"})
+
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
+    if not cur.fetchone():
+        return _trader_not_found_response(trader_id)
+
+    cur.execute("SELECT 1 FROM stocks_master WHERE symbol = %s", (symbol,))
+    if not cur.fetchone():
+        return _stock_not_found_response(symbol)
+
+    cur.execute(
+        """
+        INSERT INTO trader_watchlist (trader_id, symbol, target_price, notes, is_active, added_at)
+        VALUES (%s, %s, %s, %s, TRUE, CURRENT_DATE)
+        ON CONFLICT (trader_id, symbol)
+        DO UPDATE SET is_active = TRUE, target_price = EXCLUDED.target_price,
+                      notes = EXCLUDED.notes
+        """,
+        (trader_id, symbol, target_price, notes),
+    )
+    cur.close()
+    return {"status": "ok", "message": f"{symbol} added to watchlist"}
+
 @app.post("/watchlist/{trader_id}/add")
 async def watchlist_add(trader_id: int, request: Request):
     conn = None
@@ -2121,33 +2165,8 @@ async def watchlist_add(trader_id: int, request: Request):
         target_price = _float(body.get("target_price"))
         notes = body.get("notes") or ""
 
-        if not symbol:
-            return JSONResponse(status_code=400, content={"error": "symbol is required"})
-
         conn = _get_conn()
-        conn.autocommit = True
-        cur = conn.cursor()
-
-        cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
-        if not cur.fetchone():
-            return _trader_not_found_response(trader_id)
-
-        cur.execute("SELECT 1 FROM stocks_master WHERE symbol = %s", (symbol,))
-        if not cur.fetchone():
-            return _stock_not_found_response(symbol)
-
-        cur.execute(
-            """
-            INSERT INTO trader_watchlist (trader_id, symbol, target_price, notes, is_active, added_at)
-            VALUES (%s, %s, %s, %s, TRUE, CURRENT_DATE)
-            ON CONFLICT (trader_id, symbol)
-            DO UPDATE SET is_active = TRUE, target_price = EXCLUDED.target_price,
-                          notes = EXCLUDED.notes
-            """,
-            (trader_id, symbol, target_price, notes),
-        )
-        cur.close()
-        return {"status": "ok", "message": f"{symbol} added to watchlist"}
+        return _add_to_watchlist(conn, trader_id, symbol, target_price, notes)
     except Exception as e:
         logger.exception("watchlist_add error trader_id=%s", trader_id)
         return JSONResponse(status_code=500, content={"error": str(e)})
