@@ -127,12 +127,27 @@ def serialize_response(data: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=_jsonify(data))
 
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 class WatchlistAddRequest(BaseModel):
-    trader_id: int
+    trader_id: int | str
     symbol: str
-    target_price: float | None = None
+    target_price: float | str | None = None
+
+    @field_validator('trader_id')
+    @classmethod
+    def parse_trader_id(cls, v):
+        return int(v)
+
+    @field_validator('target_price')
+    @classmethod
+    def parse_target_price(cls, v):
+        if v is None or v == '' or v == 'null':
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
 
 @app.post("/watchlist/add")
 def add_to_watchlist_flat(req: WatchlistAddRequest):
@@ -2028,7 +2043,7 @@ def get_trader_by_chat_id(chat_id: str):
         row = cur.fetchone()
         if not row:
             return JSONResponse(
-                status_code=404,
+                status_code=200,
                 content={
                     "found": False,
                     "message": "New user - onboarding required",
