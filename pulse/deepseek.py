@@ -1624,16 +1624,22 @@ def build_proactive_pulse(
         critical_block = "\n\n".join(critical_lines)
         
         # Count how many times stop loss alert fired today
-        cur_c = conn.cursor()
-        cur_c.execute("""
-            SELECT COUNT(*) FROM pulse_log
-            WHERE trader_id = %s
-              AND pulse_date = %s
-              AND deepseek_input::text LIKE '%portfolio_stop_loss_alert%'
-              AND telegram_sent = TRUE
-        """, (trader_id, target_date))
-        alert_count = int((cur_c.fetchone() or [0])[0] or 0)
-        cur_c.close()
+        alert_count = 0
+        try:
+            cur_c = conn.cursor()
+            cur_c.execute("""
+                SELECT COUNT(*) FROM pulse_log
+                WHERE trader_id = %s
+                  AND pulse_date = %s
+                  AND deepseek_input::text LIKE '%%portfolio_stop_loss_alert%%'
+                  AND telegram_sent = TRUE
+            """, (trader_id, target_date))
+            row_c = cur_c.fetchone()
+            cur_c.close()
+            alert_count = int(row_c[0]) if row_c else 0
+        except Exception as e:
+            logger.warning("alert count query failed: %s", e)
+            alert_count = 0
         
         if alert_count == 0:
             urgency = "POSITION ALERT"
