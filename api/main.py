@@ -456,6 +456,47 @@ def extreme_moves_endpoint(threshold_pct: float = 5.0):
             conn.close()
 
 
+@app.get("/alerts/extreme-moves-today")
+def get_extreme_moves_today(threshold_pct: float = 5.0):
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT ON (symbol)
+                symbol, ltp, ycp,
+                ROUND(((ltp - ycp) / ycp * 100)::numeric, 2) as change_pct,
+                volume
+            FROM live_ticks
+            WHERE date = CURRENT_DATE
+              AND ycp > 0
+              AND ABS((ltp - ycp) / ycp * 100) >= %s
+            ORDER BY symbol, session_no DESC
+            """,
+            (threshold_pct,),
+        )
+        moves = []
+        for row in cur.fetchall():
+            moves.append({
+                "symbol": row[0],
+                "current_price": float(row[1]),
+                "ycp": float(row[2]),
+                "change_pct": float(row[3]),
+                "direction": "up" if float(row[3]) > 0 else "down",
+                "volume": int(row[4]) if row[4] else 0,
+            })
+        moves.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+        cur.close()
+        return {
+            "status": "ok",
+            "date": str(date.today()),
+            "count": len(moves),
+            "moves": moves,
+        }
+    finally:
+        conn.close()
+
+
 @app.post("/alerts/pipeline-failure")
 def pipeline_failure_alert():
     """Send a failure alert to all active traders with Telegram chat IDs."""
