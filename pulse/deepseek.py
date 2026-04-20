@@ -2263,6 +2263,10 @@ def generate_pulse(trader_id: int) -> dict:
             deepseek_output = call_deepseek(system_msg, user_msg)
         except Exception as e:
             deepseek_output = f"DeepSeek API error: {e}\n{traceback.format_exc()}"
+            use_pulse_type_e = (
+                "eod" if (pulse_type == "eod" and send_reason not in alert_reasons)
+                else None
+            )
             telegram_message = format_telegram_message(
                 deepseek_output,
                 analysis,
@@ -2270,7 +2274,7 @@ def generate_pulse(trader_id: int) -> dict:
                 target_date,
                 session_no,
                 send_reason,
-                pulse_type=("eod" if pulse_type == "eod" else None),
+                pulse_type=use_pulse_type_e,
             )
             try:
                 _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -2289,6 +2293,21 @@ def generate_pulse(trader_id: int) -> dict:
                 "portfolio_positions": len(portfolio),
             }
 
+        alert_reasons = {
+            "portfolio_stop_loss_alert",
+            "portfolio_exit_signal",
+            "portfolio_target_hit",
+            "new_trade_setup",
+            "setup_confirmed",
+            "setup_forming",
+            "predictive_signal",
+            "market_significant_move",
+            "first_session",
+        }
+        use_pulse_type = (
+            "eod" if (pulse_type == "eod" and send_reason not in alert_reasons)
+            else None
+        )
         telegram_message = format_telegram_message(
             deepseek_output,
             analysis,
@@ -2296,7 +2315,7 @@ def generate_pulse(trader_id: int) -> dict:
             target_date,
             session_no,
             send_reason,
-            pulse_type=("eod" if pulse_type == "eod" else None),
+            pulse_type=use_pulse_type,
         )
         try:
             _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
