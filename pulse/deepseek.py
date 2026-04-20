@@ -1224,41 +1224,51 @@ def should_send_pulse(
     if session_no == 1:
         return True, "first_session", meta
 
-    # ── FORMING SETUPS CHECK ─────────────────────────────
+    # ── PREDICTIVE SETUPS CHECK ──────────────────────────
     if session_no is not None and session_no > 2:
         try:
-            from analysis.engine import detect_forming_setups
+            from analysis.engine import (
+                detect_forming_setups,
+                detect_pre_breakout_coiling,
+                detect_institutional_accumulation,
+            )
             current_setups = detect_forming_setups(
                 conn, target_date, session_no
             )
             prev_setups = detect_forming_setups(
                 conn, target_date, max(0, session_no - 1)
             )
+            coiling_setups = detect_pre_breakout_coiling(conn, target_date)
+            accumulation_setups = detect_institutional_accumulation(
+                conn, target_date
+            )
             current_high = {
-                s["symbol"] for s in current_setups 
+                s["symbol"] for s in current_setups
                 if s["score"] >= 5
             }
             prev_high = {
-                s["symbol"] for s in prev_setups 
+                s["symbol"] for s in prev_setups
                 if s["score"] >= 5
             }
             new_forming = [
                 s for s in current_setups
-                if s["symbol"] not in prev_high 
+                if s["symbol"] not in prev_high
                 and s["score"] >= 5
             ]
             improved = [
                 s for s in current_setups
-                if s["symbol"] in prev_high 
+                if s["symbol"] in prev_high
                 and s["score"] >= 6
             ]
-            if new_forming or improved:
+            if new_forming or improved or coiling_setups or accumulation_setups:
                 meta["forming_setups"] = current_setups
                 meta["new_forming"] = new_forming
                 meta["improved_setups"] = improved
+                meta["coiling_setups"] = coiling_setups
+                meta["accumulation_setups"] = accumulation_setups
                 return True, "setup_forming", meta
         except Exception as e:
-            logger.warning("forming setups check failed: %s", e)
+            logger.warning("predictive setups check failed: %s", e)
 
     # Check: periodic market update even when quiet
     if session_no is not None and session_no > 0:

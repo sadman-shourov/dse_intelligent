@@ -2499,6 +2499,353 @@ def detect_forming_setups(
                                  x.get("distance_to_support_pct") or 99))
     return results[:10]
 
+def detect_pre_breakout_coiling(conn, target_date) -> list[dict]:
+    """
+    Find stocks in tight consolidation about to break out.
+    Scores 0-6. Minimum score to include: 4.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT ON (ph.symbol)
+            ph.symbol,
+            ar.stock_class,
+            ar.overall_signal,
+            ar.raw_output
+        FROM price_history ph
+        JOIN analysis_results ar
+            ON ar.symbol = ph.symbol
+            AND ar.analysis_date = %s
+        WHERE ph.date >= %s - INTERVAL '10 days'
+          AND ar.stock_class != 'GAMBLING'
+          AND ar.overall_signal IN ('WATCH', 'HOLD')
+        ORDER BY ph.symbol, ph.date DESC
+    """, (target_date, target_date))
+    candidates = cur.fetchall()
+    cur.close()
+
+    results = []
+
+    for symbol, stock_class, signal, raw in candidates:
+        raw = raw or {}
+
+        # Get last 5 sessions of price history
+        cur2 = conn.cursor()
+        cur2.execute("""
+            SELECT close, volume, high, low
+            FROM price_history
+            WHERE symbol = %s
+              AND date <= %s
+            ORDER BY date DESC
+            LIMIT 5
+        """, (symbol, target_date))
+        rows = cur2.fetchall()
+        cur2.close()
+
+        if len(rows) < 5:
+            continue
+
+        closes = [float(r[0]) for r in rows]
+        volumes = [float(r[1]) for r in rows]
+        highs = [float(r[2]) for r in rows]
+        lows = [float(r[3]) for r in rows]
+
+        if not closes or closes[0] == 0:
+            continue
+
+        current_price = closes[0]
+
+        # Condition 1: Tight price range < 3% over 5 sessions
+        price_range_pct = (max(highs) - min(lows)) / min(lows) * 100
+        tight_range = price_range_pct < 3.0
+
+        # Condition 2: Volume declining (energy coiling)
+        vol_declining = (
+            len(volumes) >= 3 and
+            volumes[0] < volumes[1] < volumes[2]
+        )
+
+        # Condition 3: Price near resistance
+        resistance_levels = raw.get('resistance_levels') or []
+        nearest_resistance = None
+        distance_to_resistance_pct = None
+        if resistance_levels:
+            valid_res = [r for r in resistance_levels
+                        if isinstance(r, (int, float))
+                        and float(r) > current_price]
+            if valid_res:
+                nearest_resistance = min(valid_res)
+                distance_to_resistance_pct = round(
+                    (nearest_resistance - current_price)
+                    / current_price * 100, 2
+                )
+        near_resistance = (
+            distance_to_resistance_pct is not None
+            and distance_to_resistance_pct <= 3.0
+        )
+
+        # Condition 4: RSI between 45-65 (has room to run)
+        rsi_data = raw.get('rsi') or {}
+        rsi_val = float(rsi_data.get('rsi') or 50)
+        rsi_in_zone = 45 <= rsi_val <= 65
+
+        # Condition 5: Above MA50 (trend supportive)
+        ma_data = raw.get('moving_averages') or {}
+        above_ma50 = ma_data.get('above_ma50')
+        ma_trend = ma_data.get('trend') or 'unknown'
+        trend_supportive = above_ma50 is True
+
+        # Condition 6: Stock class
+        good_class = stock_class in ('INVESTMENT', 'TRADING')
+
+        # Scoring
+        score = 0
+        missing = []
+
+        if tight_range:
+            score += 2
+        else:
+            missing.append(f"Price range too wide ({price_range_pct:.1f}%)")
+
+        if vol_declining:
+            score += 1
+        else:
+            missing.append("Volume not declining — energy not coiling")
+
+        if near_resistance:
+            score += 1
+        else:
+            missing.append("Not near resistance level")
+
+        if rsi_in_zone:
+            score += 1
+        else:
+            missing.append(f"RSI {rsi_val:.0f} not in breakout zone (45-65)")
+
+        if trend_supportive:
+            score += 1
+        else:
+            missing.append("Below MA50 — trend not supportive")
+
+        if score < 4:
+            continue
+
+        # Support levels
+        support_levels = raw.get('support_levels') or []
+        nearest_support = None
+        if support_levels:
+            valid_sup = [s for s in support_levels
+                        if isinstance(s, (int, float))
+                        and float(s) < current_price]
+            if valid_sup:
+                nearest_support = max(valid_sup)
+
+        results.append({
+            "symbol": symbol,
+            "current_price": current_price,
+            "score": score,
+            "max_score": 6,
+            "confidence_pct": round(score / 6 * 100),
+            "setup_type": "PRE_BREAKOUT_COILING",
+            "price_range_pct": round(price_range_pct, 2),
+            "nearest_resistance": nearest_resistance,
+            "distance_to_resistance_pct": distance_to_resistance_pct,
+            "nearest_support": nearest_support,
+            "stop_loss": round(current_price * 0.92, 2),
+            "rsi": round(rsi_val, 2),
+            "ma_trend": ma_trend,
+            "above_ma50": above_ma50,
+            "stock_class": stock_class,
+            "missing": missing,
+            "prediction": (
+                f"Coiling in tight {price_range_pct:.1f}% range. "
+                f"Breakout above {nearest_resistance} could trigger "
+                f"fast move. Watch for volume surge as entry signal."
+            ) if nearest_resistance else (
+                "Tight consolidation — watch for volume surge."
+            )
+        })
+
+    results.sort(key=lambda x: -x['score'])
+    return results[:10]
+
+
+def detect_institutional_accumulation(conn, target_date) -> list[dict]:
+    """
+    Find stocks being quietly accumulated by institutions.
+    Price flat or slightly down while volume consistently elevated.
+    Scores 0-6. Minimum score to include: 4.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT ON (ar.symbol)
+            ar.symbol,
+            ar.stock_class,
+            ar.overall_signal,
+            ar.raw_output,
+            ar.rsi
+        FROM analysis_results ar
+        WHERE ar.analysis_date = %s
+          AND ar.stock_class != 'GAMBLING'
+          AND ar.overall_signal NOT IN ('EXIT', 'BUY')
+        ORDER BY ar.symbol, ar.confidence_score DESC NULLS LAST
+    """, (target_date,))
+    candidates = cur.fetchall()
+    cur.close()
+
+    results = []
+
+    for symbol, stock_class, signal, raw, rsi_col in candidates:
+        raw = raw or {}
+
+        # Get last 10 sessions
+        cur2 = conn.cursor()
+        cur2.execute("""
+            SELECT close, volume, value
+            FROM price_history
+            WHERE symbol = %s
+              AND date <= %s
+            ORDER BY date DESC
+            LIMIT 10
+        """, (symbol, target_date))
+        rows = cur2.fetchall()
+        cur2.close()
+
+        if len(rows) < 7:
+            continue
+
+        closes = [float(r[0]) for r in rows]
+        volumes = [float(r[1]) for r in rows]
+        values = [float(r[2]) if r[2] else 0 for r in rows]
+
+        current_price = closes[0]
+        if current_price == 0:
+            continue
+
+        # Condition 1: Price flat or slightly down over 5 sessions
+        price_5d_change = (closes[0] - closes[4]) / closes[4] * 100
+        price_flat = -5.0 <= price_5d_change <= 1.0
+
+        # Condition 2: Volume consistently above 10-day average
+        avg_volume_10d = sum(volumes) / len(volumes)
+        recent_avg_volume = sum(volumes[:3]) / 3
+        volume_elevated = recent_avg_volume > avg_volume_10d * 1.2
+
+        # Condition 3: Value (BDT turnover) increasing
+        avg_value_recent = sum(values[:3]) / 3 if values[:3] else 0
+        avg_value_older = sum(values[5:8]) / 3 if len(values) >= 8 else 0
+        value_increasing = (
+            avg_value_older > 0 and
+            avg_value_recent > avg_value_older * 1.1
+        )
+
+        # Condition 4: No panic selling (no high volume down days)
+        panic_days = 0
+        for i in range(min(5, len(rows)-1)):
+            price_chg = (closes[i] - closes[i+1]) / closes[i+1] * 100
+            if price_chg < -2.0 and volumes[i] > avg_volume_10d * 1.5:
+                panic_days += 1
+        no_panic = panic_days == 0
+
+        # Condition 5: RSI < 50 (still cheap, room to run)
+        rsi_data = raw.get('rsi') or {}
+        rsi_val = float(rsi_data.get('rsi') or float(rsi_col or 50))
+        rsi_cheap = rsi_val < 50
+
+        # Condition 6: Volume price pattern
+        vp = raw.get('volume_price_pattern') or 'unknown'
+        accumulation_pattern = vp in ('accumulation', 'sellers_exhausted')
+
+        # Scoring
+        score = 0
+        missing = []
+
+        if price_flat:
+            score += 2
+        else:
+            missing.append(
+                f"Price not flat ({price_5d_change:+.1f}% over 5 sessions)"
+            )
+
+        if volume_elevated:
+            score += 1
+        else:
+            missing.append("Volume not consistently elevated")
+
+        if value_increasing:
+            score += 1
+        else:
+            missing.append("BDT turnover not increasing")
+
+        if no_panic:
+            score += 1
+        else:
+            missing.append(f"{panic_days} panic selling day(s) detected")
+
+        if rsi_cheap:
+            score += 1
+        else:
+            missing.append(f"RSI {rsi_val:.0f} — not cheap enough")
+
+        if score < 4:
+            continue
+
+        # Get resistance for target
+        resistance_levels = raw.get('resistance_levels') or []
+        first_target = None
+        if resistance_levels:
+            valid_res = [r for r in resistance_levels
+                        if isinstance(r, (int, float))
+                        and float(r) > current_price]
+            if valid_res:
+                first_target = min(valid_res)
+
+        # Get support for stop
+        support_levels = raw.get('support_levels') or []
+        nearest_support = None
+        if support_levels:
+            valid_sup = [s for s in support_levels
+                        if isinstance(s, (int, float))
+                        and float(s) < current_price]
+            if valid_sup:
+                nearest_support = max(valid_sup)
+
+        ma_data = raw.get('moving_averages') or {}
+        ma_trend = ma_data.get('trend') or 'unknown'
+
+        results.append({
+            "symbol": symbol,
+            "current_price": current_price,
+            "score": score,
+            "max_score": 6,
+            "confidence_pct": round(score / 6 * 100),
+            "setup_type": "INSTITUTIONAL_ACCUMULATION",
+            "price_5d_change_pct": round(price_5d_change, 2),
+            "volume_vs_avg_pct": round(
+                (recent_avg_volume / avg_volume_10d - 1) * 100, 1
+            ),
+            "volume_price_pattern": vp,
+            "rsi": round(rsi_val, 2),
+            "ma_trend": ma_trend,
+            "stock_class": stock_class,
+            "first_target": first_target,
+            "nearest_support": nearest_support,
+            "stop_loss": round(current_price * 0.92, 2),
+            "missing": missing,
+            "accumulation_confirmed": accumulation_pattern,
+            "prediction": (
+                f"Price flat {price_5d_change:+.1f}% over 5 sessions "
+                f"while volume is {recent_avg_volume/avg_volume_10d:.1f}x "
+                f"average. Institutions appear to be accumulating quietly. "
+                f"Watch for price to break above "
+                f"{first_target if first_target else 'resistance'} "
+                f"with volume surge."
+            )
+        })
+
+    results.sort(key=lambda x: -x['score'])
+    return results[:10]
+
+
 
 def _compute_session_no() -> int:
     """Return session 1-10 during market hours, 0 outside."""

@@ -213,6 +213,10 @@ def root():
             {"path": "/analyse/all", "method": "POST", "description": "Run analysis for all active symbols"},
             {"path": "/analyse/symbol/{symbol}", "method": "POST", "description": "Run analysis for a single symbol"},
             {"path": "/signals/today", "method": "GET", "description": "All active signals for today grouped by type"},
+            {"path": "/signals/forming", "method": "GET", "description": "Potential BUY setups likely to form"},
+            {"path": "/signals/coiling", "method": "GET", "description": "Stocks in tight coiling setups"},
+            {"path": "/signals/accumulation", "method": "GET", "description": "Institutional accumulation setups"},
+            {"path": "/signals/all-predictive", "method": "GET", "description": "Combined predictive signals overview"},
             {"path": "/evaluate/signals", "method": "POST", "description": "Evaluate past signal accuracy"},
             {"path": "/evaluate/scorecard", "method": "GET", "description": "Get recent signal scorecard"},
             {"path": "/evaluate/accuracy", "method": "POST", "description": "Calculate accuracy scores"},
@@ -222,6 +226,7 @@ def root():
             {"path": "/stock/search", "method": "GET", "description": "Search DSE symbol (query param q); exact then fuzzy"},
             {"path": "/stock/search/{query}", "method": "GET", "description": "Search DSE stock symbol by name"},
             {"path": "/alerts/extreme-moves", "method": "POST", "description": "Check and send extreme move alerts"},
+            {"path": "/alerts/extreme-moves-today", "method": "GET", "description": "Live intraday movers above threshold"},
             {"path": "/alerts/pipeline-failure", "method": "POST", "description": "Send pipeline failure alert to all traders"},
             # Pulse
             {"path": "/pulse/deliver/all", "method": "POST", "description": "Deliver latest pulse to all active traders via Telegram"},
@@ -458,40 +463,44 @@ def extreme_moves_endpoint(threshold_pct: float = 5.0):
 
 @app.get("/alerts/extreme-moves-today")
 def get_extreme_moves_today(threshold_pct: float = 5.0):
+    """Live intraday movers above threshold."""
     conn = _get_conn()
     try:
+        from datetime import date as date_type
         cur = conn.cursor()
-        cur.execute(
-            """
+        cur.execute("""
             SELECT DISTINCT ON (symbol)
                 symbol, ltp, ycp,
-                ROUND(((ltp - ycp) / ycp * 100)::numeric, 2) as change_pct,
-                volume
+                ROUND(((ltp - ycp) / NULLIF(ycp, 0) * 100)::numeric, 2)
+                    as change_pct,
+                volume,
+                session_no
             FROM live_ticks
             WHERE date = CURRENT_DATE
               AND ycp > 0
-              AND ABS((ltp - ycp) / ycp * 100) >= %s
+              AND ABS((ltp - ycp) / NULLIF(ycp, 0) * 100) >= %s
             ORDER BY symbol, session_no DESC
-            """,
-            (threshold_pct,),
-        )
+        """, (threshold_pct,))
         moves = []
         for row in cur.fetchall():
+            change_pct = float(row[3])
             moves.append({
                 "symbol": row[0],
                 "current_price": float(row[1]),
                 "ycp": float(row[2]),
-                "change_pct": float(row[3]),
-                "direction": "up" if float(row[3]) > 0 else "down",
+                "change_pct": change_pct,
+                "direction": "up" if change_pct > 0 else "down",
                 "volume": int(row[4]) if row[4] else 0,
+                "session_no": row[5],
             })
-        moves.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+        moves.sort(key=lambda x: abs(x['change_pct']), reverse=True)
         cur.close()
         return {
             "status": "ok",
-            "date": str(date.today()),
+            "date": str(date_type.today()),
+            "threshold_pct": threshold_pct,
             "count": len(moves),
-            "moves": moves,
+            "moves": moves
         }
     finally:
         conn.close()
@@ -752,6 +761,92 @@ def get_forming_setups():
         }
     finally:
         conn.close()
+
+@app.get("/signals/coiling")
+def get_coiling_setups():
+    """Stocks in tight consolidation about to break out."""
+    conn = _get_conn()
+    try:
+        from analysis.engine import detect_pre_breakout_coiling
+        today = _get_db_date(conn)
+        setups = detect_pre_breakout_coiling(conn, today)
+        return {
+            "status": "ok",
+            "date": today.isoformat(),
+            "count": len(setups),
+            "coiling_setups": setups,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/signals/accumulation")
+def get_accumulation_setups():
+    """Stocks showing institutional accumulation pattern."""
+    conn = _get_conn()
+    try:
+        from analysis.engine import detect_institutional_accumulation
+        today = _get_db_date(conn)
+        setups = detect_institutional_accumulation(conn, today)
+        return {
+            "status": "ok",
+            "date": today.isoformat(),
+            "count": len(setups),
+            "accumulation_setups": setups,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/signals/all-predictive")
+def get_all_predictive_signals():
+    """Combined view of all predictive signals."""
+    conn = _get_conn()
+    try:
+        from analysis.engine import (
+            detect_forming_setups,
+            detect_pre_breakout_coiling,
+            detect_institutional_accumulation,
+        )
+        import pytz
+        from datetime import datetime as dt
+        dhaka = pytz.timezone("Asia/Dhaka")
+        now = dt.now(dhaka)
+        session_no = 0
+        market_open = now.replace(hour=10, minute=15, second=0)
+        market_close = now.replace(hour=14, minute=30, second=0)
+        if market_open <= now <= market_close:
+            elapsed = int((now - market_open).total_seconds() / 60)
+            session_no = elapsed // 10 + 1
+
+        today = _get_db_date(conn)
+        forming = detect_forming_setups(conn, today, session_no)
+        coiling = detect_pre_breakout_coiling(conn, today)
+        accumulation = detect_institutional_accumulation(conn, today)
+
+        return {
+            "status": "ok",
+            "date": today.isoformat(),
+            "session_no": session_no,
+            "forming_setups": {
+                "count": len(forming),
+                "items": forming
+            },
+            "coiling_setups": {
+                "count": len(coiling),
+                "items": coiling
+            },
+            "accumulation_setups": {
+                "count": len(accumulation),
+                "items": accumulation
+            },
+            "total_predictive_signals": (
+                len(forming) + len(coiling) + len(accumulation)
+            )
+        }
+    finally:
+        conn.close()
+
 
 
 # ---------------------------------------------------------------------------
