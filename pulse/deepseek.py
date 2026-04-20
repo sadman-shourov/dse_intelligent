@@ -1224,23 +1224,15 @@ def should_send_pulse(
     if session_no == 1:
         return True, "first_session", meta
 
-    # ── PREDICTIVE SETUPS CHECK ──────────────────────────
+    # ── FORMING SETUPS CHECK ─────────────────────────────
     if session_no is not None and session_no > 2:
         try:
-            from analysis.engine import (
-                detect_forming_setups,
-                detect_pre_breakout_coiling,
-                detect_institutional_accumulation,
-            )
+            from analysis.engine import detect_forming_setups
             current_setups = detect_forming_setups(
                 conn, target_date, session_no
             )
             prev_setups = detect_forming_setups(
                 conn, target_date, max(0, session_no - 1)
-            )
-            coiling_setups = detect_pre_breakout_coiling(conn, target_date)
-            accumulation_setups = detect_institutional_accumulation(
-                conn, target_date
             )
             current_high = {
                 s["symbol"] for s in current_setups
@@ -1260,15 +1252,64 @@ def should_send_pulse(
                 if s["symbol"] in prev_high
                 and s["score"] >= 6
             ]
-            if new_forming or improved or coiling_setups or accumulation_setups:
+            if new_forming or improved:
                 meta["forming_setups"] = current_setups
                 meta["new_forming"] = new_forming
                 meta["improved_setups"] = improved
-                meta["coiling_setups"] = coiling_setups
-                meta["accumulation_setups"] = accumulation_setups
                 return True, "setup_forming", meta
         except Exception as e:
-            logger.warning("predictive setups check failed: %s", e)
+            logger.warning("forming setups check failed: %s", e)
+
+    # ── PREDICTIVE SIGNALS CHECK ─────────────────────────────
+    if session_no is not None and session_no > 1:
+        try:
+            from analysis.engine import (
+                detect_pre_breakout_coiling,
+                detect_institutional_accumulation,
+            )
+
+            # Get already-sent predictive symbols today
+            cur_pred = conn.cursor()
+            cur_pred.execute("""
+                SELECT deepseek_input::text
+                FROM pulse_log
+                WHERE trader_id = %s
+                  AND pulse_date = %s
+                  AND telegram_sent = TRUE
+                  AND deepseek_input::text LIKE '%%predictive_signal%%'
+            """, (trader_id, target_date))
+            sent_rows = cur_pred.fetchall()
+            cur_pred.close()
+
+            already_sent_symbols: set[str] = set()
+            for row in sent_rows:
+                import re
+                found = re.findall(r'"symbol":\s*"([^"]+)"', row[0] or "")
+                already_sent_symbols.update(found)
+
+            # Detect new coiling setups
+            coiling = detect_pre_breakout_coiling(conn, target_date)
+            new_coiling = [
+                s for s in coiling
+                if s["score"] >= 5
+                and s["symbol"] not in already_sent_symbols
+            ]
+
+            # Detect new accumulation setups
+            accumulation = detect_institutional_accumulation(conn, target_date)
+            new_accumulation = [
+                s for s in accumulation
+                if s["score"] >= 5
+                and s["symbol"] not in already_sent_symbols
+            ]
+
+            if new_coiling or new_accumulation:
+                meta["new_coiling"] = new_coiling
+                meta["new_accumulation"] = new_accumulation
+                return True, "predictive_signal", meta
+
+        except Exception as e:
+            logger.warning("predictive signal check failed: %s", e)
 
     # Check: periodic market update even when quiet
     if session_no is not None and session_no > 0:
@@ -1673,6 +1714,43 @@ def build_proactive_pulse(
             f"Focus for today: prioritise risk, then highest conviction NOW setups.\n"
         )
 
+        # Add predictive signals to first session
+        try:
+            from analysis.engine import (
+                detect_pre_breakout_coiling,
+                detect_institutional_accumulation,
+            )
+            coiling = detect_pre_breakout_coiling(conn, target_date)
+            accumulation = detect_institutional_accumulation(
+                conn, target_date
+            )
+            top_coiling = [s for s in coiling if s["score"] >= 4][:3]
+            top_accum = [s for s in accumulation if s["score"] >= 5][:3]
+
+            pred_lines = []
+            for s in top_coiling:
+                pred_lines.append(
+                    f"COILING: {s['symbol']} @ {s['current_price']}"
+                    f" — range {s['price_range_pct']}%"
+                    f" | breakout above {s.get('nearest_resistance', 'resistance')}"
+                    f" | stop {s['stop_loss']}"
+                )
+            for s in top_accum:
+                pred_lines.append(
+                    f"ACCUMULATION: {s['symbol']} @ {s['current_price']}"
+                    f" — volume {s['volume_vs_avg_pct']}% above avg"
+                    f" | target {s.get('first_target', 'resistance')}"
+                    f" | stop {s['stop_loss']}"
+                )
+
+            if pred_lines:
+                pred_block = "\n".join(pred_lines)
+                user_msg += (
+                    f"\nEARLY RADAR (pre-signals):\n{pred_block}\n"
+                )
+        except Exception as e:
+            logger.warning("predictive signals in first_session failed: %s", e)
+
     elif send_reason == "market_update":
         buy_count = len(analysis_summary.get("buy_signals", []))
         watch_count = analysis_summary.get("watch_signal_total", 0)
@@ -1752,6 +1830,53 @@ def build_proactive_pulse(
             f"These are pre-signals. Watch for confirmation "
             f"next session. If conditions complete, a BUY "
             f"signal will fire."
+        )
+
+    elif send_reason == "predictive_signal":
+        new_coiling = meta.get("new_coiling", [])
+        new_accumulation = meta.get("new_accumulation", [])
+        all_signals = (new_coiling + new_accumulation)[:5]
+
+        signal_lines = []
+        for s in all_signals:
+            setup_type = s.get("setup_type", "")
+            symbol = s["symbol"]
+            price = s["current_price"]
+            score = s["score"]
+            max_score = s.get("max_score", 6)
+            prediction = s.get("prediction", "")
+            target = s.get("first_target") or s.get("nearest_resistance")
+            stop = s.get("stop_loss")
+            missing = s.get("missing", [])
+
+            if setup_type == "PRE_BREAKOUT_COILING":
+                type_label = "COILING — breakout building"
+            elif setup_type == "INSTITUTIONAL_ACCUMULATION":
+                type_label = "ACCUMULATION — smart money buying"
+            else:
+                type_label = setup_type
+
+            signal_lines.append(
+                f"{symbol} @ {price} | Score {score}/{max_score}"
+                f" | {type_label}\n"
+                f"Prediction: {prediction}\n"
+                f"Target: {target} | Stop: {stop}\n"
+                f"Still needs: {', '.join(missing) if missing else 'all conditions met'}"
+            )
+
+        signals_block = "\n\n".join(signal_lines) or "None identified."
+
+        user_msg = (
+            f"PREDICTIVE SIGNAL ALERT\n"
+            f"Session: {session_no} | Date: {target_date}\n"
+            f"{dsex_context_line}\n\n"
+            f"EARLY OPPORTUNITIES — ACT BEFORE THE CROWD:\n\n"
+            f"{signals_block}\n\n"
+            f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
+            f"These are PRE-signals. Price has NOT moved yet. "
+            f"This is the window to position BEFORE the move. "
+            f"Confirm with volume before entering. "
+            f"Stop loss is mandatory on every trade."
         )
 
     else:
@@ -1841,6 +1966,7 @@ def format_telegram_message(
         "new_trade_setup": "🚨 NexTrade — Live Trade Alert",
         "setup_confirmed": "⚡ NexTrade — Setup Confirmed",
         "setup_forming": "🔭 NexTrade — Setup Forming",
+        "predictive_signal": "🔮 NexTrade — Early Signal",
         "portfolio_stop_loss_alert": "⚠️ NexTrade — Position Alert",
         "portfolio_target_hit": "💰 NexTrade — Target Hit",
         "market_significant_move": "📊 NexTrade — Market Alert",
