@@ -1879,10 +1879,8 @@ def build_proactive_pulse(
             f"EARLY OPPORTUNITIES — ACT BEFORE THE CROWD:\n\n"
             f"{signals_block}\n\n"
             f"PORTFOLIO:\n{_portfolio_lines()}\n\n"
-            f"These are PRE-signals. Price has NOT moved yet. "
-            f"This is the window to position BEFORE the move. "
-            f"Confirm with volume before entering. "
-            f"Stop loss is mandatory on every trade."
+            f"Pre-signal but actionable. Give entry zone, stop loss, "
+            f"and the exact condition that confirms the trade."
         )
 
     else:
