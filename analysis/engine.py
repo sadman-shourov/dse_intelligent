@@ -17,6 +17,16 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 
 
+def _to_float(val):
+    """Convert Decimal or any numeric DB value to float safely."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -65,7 +75,23 @@ def get_price_history(symbol: str, days: int = 90) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "ltp", "ycp", "volume", "trade", "value"])
 
-    df = pd.DataFrame(rows, columns=cols)
+    cleaned = [
+        (
+            row[0],
+            _to_float(row[1]),
+            _to_float(row[2]),
+            _to_float(row[3]),
+            _to_float(row[4]),
+            _to_float(row[5]),
+            _to_float(row[6]),
+            _to_float(row[7]),
+            _to_float(row[8]),
+            _to_float(row[9]),
+            _to_float(row[10]),
+        )
+        for row in rows
+    ]
+    df = pd.DataFrame(cleaned, columns=cols)
     return df.sort_values("date").reset_index(drop=True)
 
 
@@ -92,21 +118,25 @@ def get_latest_live_tick(symbol: str, as_of_date: date | None = None) -> list[di
     finally:
         conn.close()
 
-    return [
-        {
-            "session_no": r[0],
-            "ltp": float(r[1]) if r[1] is not None else None,
-            "high": float(r[2]) if r[2] is not None else None,
-            "low": float(r[3]) if r[3] is not None else None,
-            "volume": int(r[4]) if r[4] is not None else 0,
-            "close": float(r[5]) if r[5] is not None else None,
-            "ycp": float(r[6]) if r[6] is not None else None,
-            "change_val": float(r[7]) if r[7] is not None else None,
-            "trade": int(r[8]) if r[8] is not None else 0,
-            "value": float(r[9]) if r[9] is not None else None,
-        }
-        for r in rows
-    ]
+    out_ticks: list[dict] = []
+    for r in rows:
+        v_vol = _to_float(r[4])
+        v_trade = _to_float(r[8])
+        out_ticks.append(
+            {
+                "session_no": r[0],
+                "ltp": _to_float(r[1]),
+                "high": _to_float(r[2]),
+                "low": _to_float(r[3]),
+                "volume": int(v_vol) if v_vol is not None else 0,
+                "close": _to_float(r[5]),
+                "ycp": _to_float(r[6]),
+                "change_val": _to_float(r[7]),
+                "trade": int(v_trade) if v_trade is not None else 0,
+                "value": _to_float(r[9]),
+            }
+        )
+    return out_ticks
 
 
 def get_pe_ratio(symbol: str) -> float | None:
@@ -130,10 +160,7 @@ def get_pe_ratio(symbol: str) -> float | None:
 
     if not row or row[0] is None:
         return None
-    try:
-        return float(row[0])
-    except Exception:
-        return None
+    return _to_float(row[0])
 
 
 def get_eps(symbol: str) -> float | None:
@@ -157,10 +184,7 @@ def get_eps(symbol: str) -> float | None:
 
     if not row or row[0] is None:
         return None
-    try:
-        return float(row[0])
-    except Exception:
-        return None
+    return _to_float(row[0])
 
 
 def get_market_summary(dt: str | None = None) -> dict | None:
@@ -188,11 +212,11 @@ def get_market_summary(dt: str | None = None) -> dict | None:
     if not row:
         return None
     return {
-        "dsex_index": row[0],
-        "dses_index": row[1],
-        "total_volume": row[2],
-        "total_value_mn": row[3],
-        "total_trade": row[4],
+        "dsex_index": _to_float(row[0]),
+        "dses_index": _to_float(row[1]),
+        "total_volume": _to_float(row[2]),
+        "total_value_mn": _to_float(row[3]),
+        "total_trade": _to_float(row[4]),
         "trade_date": row[5].isoformat() if row[5] is not None else target,
     }
 
@@ -223,11 +247,11 @@ def get_previous_market_summary(dt: str | None = None) -> dict | None:
     if not row:
         return None
     return {
-        "dsex_index": row[0],
-        "dses_index": row[1],
-        "total_volume": row[2],
-        "total_value_mn": row[3],
-        "total_trade": row[4],
+        "dsex_index": _to_float(row[0]),
+        "dses_index": _to_float(row[1]),
+        "total_volume": _to_float(row[2]),
+        "total_value_mn": _to_float(row[3]),
+        "total_trade": _to_float(row[4]),
         "trade_date": row[5].isoformat() if row[5] is not None else None,
     }
 
@@ -255,7 +279,23 @@ def bulk_fetch_price_history(days: int = 90) -> dict[str, pd.DataFrame]:
     if not rows:
         return {}
 
-    df = pd.DataFrame(rows, columns=cols)
+    cleaned = [
+        (
+            row[0],
+            row[1],
+            _to_float(row[2]),
+            _to_float(row[3]),
+            _to_float(row[4]),
+            _to_float(row[5]),
+            _to_float(row[6]),
+            _to_float(row[7]),
+            _to_float(row[8]),
+            _to_float(row[9]),
+            _to_float(row[10]),
+        )
+        for row in rows
+    ]
+    df = pd.DataFrame(cleaned, columns=cols)
     out: dict[str, pd.DataFrame] = {}
     for symbol, grp in df.groupby("symbol", sort=False):
         out[str(symbol)] = grp.drop(columns=["symbol"]).reset_index(drop=True)
@@ -285,18 +325,20 @@ def bulk_fetch_live_ticks() -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
     for r in rows:
         sym = r[0]
+        v_trade = _to_float(r[9])
+        v_vol = _to_float(r[11])
         entry = {
             "session_no": r[1],
             "fetched_at": r[2],
-            "ltp": float(r[3]) if r[3] is not None else None,
-            "high": float(r[4]) if r[4] is not None else None,
-            "low": float(r[5]) if r[5] is not None else None,
-            "close": float(r[6]) if r[6] is not None else None,
-            "ycp": float(r[7]) if r[7] is not None else None,
-            "change_val": float(r[8]) if r[8] is not None else None,
-            "trade": int(r[9]) if r[9] is not None else 0,
-            "value": float(r[10]) if r[10] is not None else None,
-            "volume": int(r[11]) if r[11] is not None else 0,
+            "ltp": _to_float(r[3]),
+            "high": _to_float(r[4]),
+            "low": _to_float(r[5]),
+            "close": _to_float(r[6]),
+            "ycp": _to_float(r[7]),
+            "change_val": _to_float(r[8]),
+            "trade": int(v_trade) if v_trade is not None else 0,
+            "value": _to_float(r[10]),
+            "volume": int(v_vol) if v_vol is not None else 0,
         }
         out.setdefault(sym, []).append(entry)
     return out
@@ -320,13 +362,7 @@ def bulk_fetch_pe_ratios() -> dict[str, float | None]:
 
     out: dict[str, float | None] = {}
     for sym, pe in rows:
-        if pe is None:
-            out[sym] = None
-        else:
-            try:
-                out[sym] = float(pe)
-            except Exception:
-                out[sym] = None
+        out[sym] = _to_float(pe)
     return out
 
 
@@ -348,13 +384,7 @@ def bulk_fetch_eps() -> dict[str, float | None]:
 
     out: dict[str, float | None] = {}
     for sym, eps in rows:
-        if eps is None:
-            out[sym] = None
-        else:
-            try:
-                out[sym] = float(eps)
-            except Exception:
-                out[sym] = None
+        out[sym] = _to_float(eps)
     return out
 
 
@@ -378,14 +408,8 @@ def bulk_fetch_fundamentals() -> tuple[dict[str, float | None], dict[str, float 
     pe_map: dict[str, float | None] = {}
     eps_map: dict[str, float | None] = {}
     for sym, pe, eps in rows:
-        try:
-            pe_map[sym] = float(pe) if pe is not None else None
-        except Exception:
-            pe_map[sym] = None
-        try:
-            eps_map[sym] = float(eps) if eps is not None else None
-        except Exception:
-            eps_map[sym] = None
+        pe_map[sym] = _to_float(pe)
+        eps_map[sym] = _to_float(eps)
     return pe_map, eps_map
 
 
@@ -451,11 +475,11 @@ def bulk_fetch_market_summary() -> tuple[dict | None, dict | None]:
     def to_dict(r):
         return {
             "trade_date": r[0].isoformat() if r[0] is not None else None,
-            "dsex_index": r[1],
-            "dses_index": r[2],
-            "total_volume": r[3],
-            "total_value_mn": r[4],
-            "total_trade": r[5],
+            "dsex_index": _to_float(r[1]),
+            "dses_index": _to_float(r[2]),
+            "total_volume": _to_float(r[3]),
+            "total_value_mn": _to_float(r[4]),
+            "total_trade": _to_float(r[5]),
         }
 
     today_summary = to_dict(rows[0]) if len(rows) >= 1 else None
@@ -487,18 +511,20 @@ def bulk_fetch_market_context(target_date: date) -> dict:
         return {}
 
     r = rows[0]
+    tv = _to_float(r[3])
+    tt = _to_float(r[5])
     ctx: dict = {
         "trade_date": r[0].isoformat() if r[0] is not None else None,
-        "dsex_index": float(r[1]) if r[1] is not None else None,
-        "dses_index": float(r[2]) if r[2] is not None else None,
-        "total_volume": int(r[3]) if r[3] is not None else None,
-        "total_value_mn": float(r[4]) if r[4] is not None else None,
-        "total_trade": int(r[5]) if r[5] is not None else None,
+        "dsex_index": _to_float(r[1]),
+        "dses_index": _to_float(r[2]),
+        "total_volume": int(tv) if tv is not None else None,
+        "total_value_mn": _to_float(r[4]),
+        "total_trade": int(tt) if tt is not None else None,
         "dsex_change_pct": None,
     }
 
     if len(rows) >= 2:
-        prev_dsex = float(rows[1][1]) if rows[1][1] is not None else None
+        prev_dsex = _to_float(rows[1][1])
         today_dsex = ctx["dsex_index"]
         if prev_dsex and today_dsex and prev_dsex != 0:
             ctx["dsex_change_pct"] = round((today_dsex - prev_dsex) / prev_dsex * 100, 2)
@@ -528,7 +554,7 @@ def detect_market_trend(conn) -> dict:
         return empty
 
     # Filter out None dsex values
-    rows = [(r[0], float(r[1])) for r in rows if r[1] is not None]
+    rows = [(r[0], x) for r in rows for x in [_to_float(r[1])] if x is not None]
     if len(rows) < 2:
         return empty
 
@@ -1458,8 +1484,8 @@ def determine_overall_signal(
         score_breakdown["market_bonus"] += 6
 
     if consecutive_down == 2:
-        score -= 8
-        score_breakdown["market_bonus"] -= 8
+        score -= 4
+        score_breakdown["market_bonus"] -= 4
     elif consecutive_down >= 3:
         score -= 20   # already captured in downtrend but stack it
         score_breakdown["market_bonus"] -= 20
@@ -1489,7 +1515,7 @@ def determine_overall_signal(
         hard_buy_blocked = True
     if flags.get("new_listing") or flags.get("suspected_z_category") or flags.get("mutual_fund"):
         hard_buy_blocked = True
-    if history_len < 60:
+    if history_len < 30:
         hard_buy_blocked = True
     if rsi_float is not None and rsi_float > 70:
         hard_buy_blocked = True
@@ -1502,7 +1528,12 @@ def determine_overall_signal(
             pass
 
     # Stricter thresholds + confirming-signal requirement for BUY
-    if score >= 80 and confirming_signals >= 2 and not hard_buy_blocked:
+    market_is_downtrend = trend == "downtrend" or consecutive_down >= 3
+    buy_threshold = 80 if market_is_downtrend else 75
+
+    if rsi_float is not None and rsi_float < 32 and score >= 68 and not hard_buy_blocked:
+        signal = "BUY"
+    elif score >= buy_threshold and confirming_signals >= 2 and not hard_buy_blocked:
         signal = "BUY"
     elif score >= 60:
         signal = "WATCH"
@@ -1992,10 +2023,6 @@ def analyse_symbol(
             if prev == 'EXIT' and signal == 'BUY':
                 signal = 'WATCH'
                 confidence = min(float(confidence or 0.0), 0.64)
-            if signal == 'BUY' and prev not in ('BUY', 'WATCH'):
-                signal = 'WATCH'
-                confidence = min(float(confidence or 0.0), 0.64)
-
         analysis_date = target_date.isoformat()
         current_price = _current_price(df)
         mc_for_setup = market_context if market_context is not None else {
@@ -2334,7 +2361,7 @@ def detect_forming_setups(
     for row in rows:
         symbol        = row[0]
         signal        = row[1]
-        confidence    = float(row[2] or 0)
+        confidence    = _to_float(row[2]) or 0.0
         stock_class   = row[3]
         support_levels    = row[4] or []
         resistance_levels = row[5] or []
@@ -2544,10 +2571,10 @@ def detect_pre_breakout_coiling(conn, target_date) -> list[dict]:
         if len(rows) < 5:
             continue
 
-        closes = [float(r[0]) for r in rows]
-        volumes = [float(r[1]) for r in rows]
-        highs = [float(r[2]) for r in rows]
-        lows = [float(r[3]) for r in rows]
+        closes = [_to_float(r[0]) for r in rows]
+        volumes = [_to_float(r[1]) for r in rows]
+        highs = [_to_float(r[2]) for r in rows]
+        lows = [_to_float(r[3]) for r in rows]
 
         if not closes or closes[0] == 0:
             continue
@@ -2713,9 +2740,9 @@ def detect_institutional_accumulation(conn, target_date) -> list[dict]:
         if len(rows) < 7:
             continue
 
-        closes = [float(r[0]) for r in rows]
-        volumes = [float(r[1]) for r in rows]
-        values = [float(r[2]) if r[2] else 0 for r in rows]
+        closes = [_to_float(r[0]) for r in rows]
+        volumes = [_to_float(r[1]) for r in rows]
+        values = [(_to_float(r[2]) or 0) for r in rows]
 
         current_price = closes[0]
         if current_price == 0:
