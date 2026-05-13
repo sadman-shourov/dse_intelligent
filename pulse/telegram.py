@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -285,138 +286,35 @@ def deliver_pulse(trader_id: int | None = None) -> dict[str, Any]:
 
         total = len(traders)
 
-        for t in traders:
-            tid = t["id"]
-            name = t["name"]
-            chat = t["telegram_chat_id"]
-            telegram_message: str | None = None
-            pulse_row_id: int | None = None
-
-            # Always generate fresh pulse (avoid reusing stale pulse_log rows)
-            from pulse.deepseek import generate_pulse
-
-            logger.info("Generating fresh pulse for trader_id=%s on %s", tid, target_date)
-            result = generate_pulse(tid)
-            if result.get("status") != "ok":
-                logger.warning(
-                    "generate_pulse failed for trader %s (%s): %s",
-                    tid,
-                    name,
-                    result,
-                )
-                failed += 1
-                details.append(
-                    {
-                        "trader_id": tid,
-                        "name": name,
-                        "status": "skipped",
-                        "reason": result.get("status", "error"),
-                        "detail": result.get("message") or result.get("reason"),
-                    }
-                )
-                continue
-
-            telegram_message = result.get("telegram_message")
-
-            latest = get_latest_pulse(conn, tid, target_date)
-            pulse_row_id = latest["id"] if latest else None
-
-            if not telegram_message or not str(telegram_message).strip():
-                logger.warning("Empty telegram_message for trader %s (%s); skip", tid, name)
-                failed += 1
-                details.append(
-                    {
-                        "trader_id": tid,
-                        "name": name,
-                        "status": "skipped",
-                        "reason": "empty_message",
-                        "pulse_id": pulse_row_id,
-                    }
-                )
-                continue
-
-            msg = truncate_telegram_message(str(telegram_message).strip())
-            try:
-                send_res = send_telegram_message(chat_id=chat, message=msg)
-            except Exception as e:
-                logger.exception("send_telegram_message raised for trader %s (%s): %s", tid, name, e)
-                if pulse_row_id is not None:
-                    try:
-                        mark_pulse_telegram_failed(conn, pulse_row_id)
-                    except Exception:
-                        logger.exception("mark_pulse_telegram_failed failed for pulse_id=%s", pulse_row_id)
-                failed += 1
-                details.append(
-                    {
-                        "trader_id": tid,
-                        "name": name,
-                        "status": "error",
-                        "error": str(e),
-                        "pulse_id": pulse_row_id,
-                    }
-                )
-                continue
-
-            if send_res.get("status") == "ok":
-                if pulse_row_id is None:
-                    logger.error(
-                        "Telegram send ok but no pulse_log id for trader %s (%s); cannot mark sent",
-                        tid,
-                        name,
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_deliver_pulse_for_trader, t, target_date): t
+                for t in traders
+            }
+            for future in as_completed(futures):
+                t = futures[future]
+                try:
+                    delivered_inc, failed_inc, detail = future.result()
+                except Exception as e:
+                    logger.exception(
+                        "deliver_pulse worker raised for trader %s (%s): %s",
+                        t.get("id"),
+                        t.get("name"),
+                        e,
                     )
                     failed += 1
                     details.append(
                         {
-                            "trader_id": tid,
-                            "name": name,
+                            "trader_id": t.get("id"),
+                            "name": t.get("name"),
                             "status": "error",
-                            "error": "pulse_log row not found after send",
-                            "message_id": send_res.get("message_id"),
-                            "pulse_id": None,
+                            "error": str(e),
                         }
                     )
-                else:
-                    mark_pulse_sent(conn, pulse_row_id, int(send_res["message_id"]))
-                    delivered += 1
-                    logger.info(
-                        "Delivered pulse to trader %s (%s) message_id=%s",
-                        tid,
-                        name,
-                        send_res.get("message_id"),
-                    )
-                    details.append(
-                        {
-                            "trader_id": tid,
-                            "name": name,
-                            "status": "delivered",
-                            "message_id": send_res.get("message_id"),
-                            "pulse_id": pulse_row_id,
-                            "attempt": send_res.get("attempt"),
-                        }
-                    )
-            else:
-                if pulse_row_id is not None:
-                    try:
-                        mark_pulse_telegram_failed(conn, pulse_row_id)
-                    except Exception:
-                        logger.exception("mark_pulse_telegram_failed failed for pulse_id=%s", pulse_row_id)
-                failed += 1
-                logger.warning(
-                    "Telegram delivery failed for trader %s (%s): %s",
-                    tid,
-                    name,
-                    send_res.get("error"),
-                )
-                details.append(
-                    {
-                        "trader_id": tid,
-                        "name": name,
-                        "status": "failed",
-                        "error": send_res.get("error"),
-                        "pulse_id": pulse_row_id,
-                        "attempts": send_res.get("attempts"),
-                    }
-                )
+                    continue
+                delivered += delivered_inc
+                failed += failed_inc
+                details.append(detail)
 
         return {
             "status": "ok",
@@ -428,6 +326,123 @@ def deliver_pulse(trader_id: int | None = None) -> dict[str, Any]:
         }
     finally:
         conn.close()
+
+
+def _deliver_pulse_for_trader(t: dict[str, Any], target_date) -> tuple[int, int, dict[str, Any]]:
+    """Per-trader worker for deliver_pulse. Opens its own DB connection so
+    multiple workers can run concurrently without sharing a psycopg2 conn."""
+    tid = t["id"]
+    name = t["name"]
+    chat = t["telegram_chat_id"]
+    pulse_row_id: int | None = None
+
+    from pulse.deepseek import generate_pulse
+
+    logger.info("Generating fresh pulse for trader_id=%s on %s", tid, target_date)
+    result = generate_pulse(tid)
+    if result.get("status") != "ok":
+        logger.warning(
+            "generate_pulse failed for trader %s (%s): %s", tid, name, result
+        )
+        return 0, 1, {
+            "trader_id": tid,
+            "name": name,
+            "status": "skipped",
+            "reason": result.get("status", "error"),
+            "detail": result.get("message") or result.get("reason"),
+        }
+
+    telegram_message = result.get("telegram_message")
+
+    conn = get_db_connection()
+    conn.autocommit = True
+    try:
+        latest = get_latest_pulse(conn, tid, target_date)
+        pulse_row_id = latest["id"] if latest else None
+
+        if not telegram_message or not str(telegram_message).strip():
+            logger.warning("Empty telegram_message for trader %s (%s); skip", tid, name)
+            return 0, 1, {
+                "trader_id": tid,
+                "name": name,
+                "status": "skipped",
+                "reason": "empty_message",
+                "pulse_id": pulse_row_id,
+            }
+
+        msg = truncate_telegram_message(str(telegram_message).strip())
+        try:
+            send_res = send_telegram_message(chat_id=chat, message=msg)
+        except Exception as e:
+            logger.exception("send_telegram_message raised for trader %s (%s): %s", tid, name, e)
+            if pulse_row_id is not None:
+                try:
+                    mark_pulse_telegram_failed(conn, pulse_row_id)
+                except Exception:
+                    logger.exception("mark_pulse_telegram_failed failed for pulse_id=%s", pulse_row_id)
+            return 0, 1, {
+                "trader_id": tid,
+                "name": name,
+                "status": "error",
+                "error": str(e),
+                "pulse_id": pulse_row_id,
+            }
+
+        if send_res.get("status") == "ok":
+            if pulse_row_id is None:
+                logger.error(
+                    "Telegram send ok but no pulse_log id for trader %s (%s); cannot mark sent",
+                    tid,
+                    name,
+                )
+                return 0, 1, {
+                    "trader_id": tid,
+                    "name": name,
+                    "status": "error",
+                    "error": "pulse_log row not found after send",
+                    "message_id": send_res.get("message_id"),
+                    "pulse_id": None,
+                }
+            mark_pulse_sent(conn, pulse_row_id, int(send_res["message_id"]))
+            logger.info(
+                "Delivered pulse to trader %s (%s) message_id=%s",
+                tid,
+                name,
+                send_res.get("message_id"),
+            )
+            return 1, 0, {
+                "trader_id": tid,
+                "name": name,
+                "status": "delivered",
+                "message_id": send_res.get("message_id"),
+                "pulse_id": pulse_row_id,
+                "attempt": send_res.get("attempt"),
+            }
+
+        if pulse_row_id is not None:
+            try:
+                mark_pulse_telegram_failed(conn, pulse_row_id)
+            except Exception:
+                logger.exception("mark_pulse_telegram_failed failed for pulse_id=%s", pulse_row_id)
+        logger.warning(
+            "Telegram delivery failed for trader %s (%s): %s",
+            tid,
+            name,
+            send_res.get("error"),
+        )
+        return 0, 1, {
+            "trader_id": tid,
+            "name": name,
+            "status": "failed",
+            "error": send_res.get("error"),
+            "pulse_id": pulse_row_id,
+            "attempts": send_res.get("attempts"),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def deliver_pulse_if_needed() -> dict[str, Any]:
