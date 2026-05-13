@@ -116,23 +116,27 @@ def evaluate_past_signals(days_back: int = 5) -> dict:
         best: tuple[str, float] | None = None
         worst: tuple[str, float] | None = None
 
+        distinct_symbols = list({row[0] for row in signals})
+        price_map: dict[str, float | None] = {}
+        if distinct_symbols:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (symbol) symbol, COALESCE(ltp, close) AS price
+                FROM price_history
+                WHERE symbol = ANY(%s)
+                ORDER BY symbol, date DESC
+                """,
+                (distinct_symbols,),
+            )
+            for sym, price in cur.fetchall():
+                price_map[sym] = _float(price)
+
         for symbol, signal_type, signal_date, price_at_signal, reason in signals:
             price_at_signal_f = _float(price_at_signal)
             if not price_at_signal_f or price_at_signal_f <= 0:
                 continue
 
-            # Get latest price
-            cur.execute(
-                """
-                SELECT ltp, close FROM price_history
-                WHERE symbol = %s ORDER BY date DESC LIMIT 1
-                """,
-                (symbol,),
-            )
-            pr = cur.fetchone()
-            if not pr:
-                continue
-            current_price = _float(pr[0]) or _float(pr[1])
+            current_price = price_map.get(symbol)
             if not current_price or current_price <= 0:
                 continue
 
