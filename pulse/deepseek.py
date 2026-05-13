@@ -552,6 +552,7 @@ def _enrich_position_row(cur, symbol: str, quantity: int, avg_buy_price: float) 
 def get_trader_portfolio(conn, trader_id: int) -> list[dict]:
     cur = conn.cursor()
     try:
+        positions_rows: list[tuple] = []
         if _table_exists(cur, "portfolio_holdings"):
             ph_cols = _columns(cur, "portfolio_holdings")
             if "trader_id" in ph_cols and "is_open" in ph_cols:
@@ -563,12 +564,8 @@ def get_trader_portfolio(conn, trader_id: int) -> list[dict]:
                     """,
                     (trader_id,),
                 )
-                out: list[dict] = []
-                for symbol, qty, avg_px in cur.fetchall():
-                    row = _enrich_position_row(cur, symbol, int(qty or 0), float(avg_px or 0))
-                    if row:
-                        out.append(row)
-                return out
+                positions_rows = cur.fetchall()
+                return _build_enriched_positions(cur, positions_rows)
 
         pos_cols = _columns(cur, "positions")
         if "trader_id" in pos_cols:
@@ -580,15 +577,101 @@ def get_trader_portfolio(conn, trader_id: int) -> list[dict]:
                 """,
                 (trader_id,),
             )
-            out2: list[dict] = []
-            for symbol, qty, avg_px in cur.fetchall():
-                row = _enrich_position_row(cur, symbol, int(qty or 0), float(avg_px or 0))
-                if row:
-                    out2.append(row)
-            return out2
+            positions_rows = cur.fetchall()
+            return _build_enriched_positions(cur, positions_rows)
         return []
     finally:
         cur.close()
+
+
+def _build_enriched_positions(cur, positions_rows: list[tuple]) -> list[dict]:
+    out: list[dict] = []
+    if not positions_rows:
+        return out
+
+    symbols = [r[0] for r in positions_rows]
+
+    analysis_map: dict[str, tuple] = {}
+    cur.execute(
+        """
+        SELECT DISTINCT ON (symbol) symbol, overall_signal, raw_output
+        FROM analysis_results
+        WHERE symbol = ANY(%s) AND analysis_date = CURRENT_DATE
+        ORDER BY symbol, session_no DESC NULLS LAST, id DESC
+        """,
+        (symbols,),
+    )
+    for s, sig, raw in cur.fetchall():
+        analysis_map[s] = (sig, raw)
+
+    signal_reason_map: dict[str, str] = {}
+    cur.execute(
+        """
+        SELECT DISTINCT ON (symbol) symbol, reason
+        FROM signals
+        WHERE symbol = ANY(%s) AND signal_date = CURRENT_DATE AND is_active = TRUE
+        ORDER BY symbol, id DESC
+        """,
+        (symbols,),
+    )
+    for s, reason in cur.fetchall():
+        signal_reason_map[s] = reason or ""
+
+    price_map: dict[str, tuple] = {}
+    cur.execute(
+        """
+        SELECT DISTINCT ON (symbol) symbol, ltp, close
+        FROM price_history
+        WHERE symbol = ANY(%s)
+        ORDER BY symbol, date DESC
+        """,
+        (symbols,),
+    )
+    for s, ltp_v, close_v in cur.fetchall():
+        price_map[s] = (ltp_v, close_v)
+
+    for symbol, qty_raw, avg_px_raw in positions_rows:
+        quantity = int(qty_raw or 0)
+        avg_buy_price = float(avg_px_raw or 0)
+        if quantity <= 0 or avg_buy_price <= 0:
+            continue
+
+        signal = "HOLD"
+        current_price = None
+        ar = analysis_map.get(symbol)
+        if ar:
+            signal = ar[0] or "HOLD"
+            raw = _parse_json_dict(ar[1])
+            sr = raw.get("sr") or {}
+            current_price = _float_or_none(raw.get("current_price"))
+            if current_price is None:
+                current_price = _float_or_none(sr.get("current_price"))
+
+        reason = signal_reason_map.get(symbol, "")
+
+        if current_price is None:
+            pr = price_map.get(symbol)
+            if pr:
+                current_price = _float_or_none(pr[0]) or _float_or_none(pr[1])
+
+        if current_price is None:
+            current_price = avg_buy_price
+
+        pnl_pct = ((current_price - avg_buy_price) / avg_buy_price) * 100.0 if avg_buy_price else 0.0
+        pnl_value = (current_price - avg_buy_price) * quantity
+
+        out.append({
+            "symbol": symbol,
+            "quantity": quantity,
+            "avg_buy_price": avg_buy_price,
+            "current_price": current_price,
+            "pnl_pct": round(pnl_pct, 2),
+            "pnl_value": round(pnl_value, 2),
+            "signal": signal,
+            "reason": reason or "",
+        })
+
+    return out
 
 
 def get_trader_watchlist(conn, trader_id: int) -> list[dict]:
