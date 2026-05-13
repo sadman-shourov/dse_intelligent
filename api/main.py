@@ -1750,26 +1750,39 @@ def get_watchlist(trader_id: int):
         items = cur.fetchall()
 
         watchlist = []
-        for sym, added_at, target_price, notes in items:
-            # Current price
-            cur.execute(
-                "SELECT ltp, close FROM price_history WHERE symbol = %s ORDER BY date DESC LIMIT 1",
-                (sym,),
-            )
-            ph = cur.fetchone()
-            current_price = (_float(ph[0]) or _float(ph[1])) if ph else None
-
-            # Current signal and reason
+        watch_symbols = [it[0] for it in items]
+        price_map: dict[str, tuple] = {}
+        analysis_map: dict[str, tuple] = {}
+        if watch_symbols:
             cur.execute(
                 """
-                SELECT DISTINCT ON (symbol) overall_signal, raw_output
+                SELECT DISTINCT ON (symbol) symbol, ltp, close
+                FROM price_history
+                WHERE symbol = ANY(%s)
+                ORDER BY symbol, date DESC
+                """,
+                (watch_symbols,),
+            )
+            for s, ltp_v, close_v in cur.fetchall():
+                price_map[s] = (ltp_v, close_v)
+
+            cur.execute(
+                """
+                SELECT DISTINCT ON (symbol) symbol, overall_signal, raw_output
                 FROM analysis_results
-                WHERE symbol = %s
+                WHERE symbol = ANY(%s)
                 ORDER BY symbol, analysis_date DESC, session_no DESC NULLS LAST, id DESC
                 """,
-                (sym,),
+                (watch_symbols,),
             )
-            ar = cur.fetchone()
+            for s, sig_v, raw_v in cur.fetchall():
+                analysis_map[s] = (sig_v, raw_v)
+
+        for sym, added_at, target_price, notes in items:
+            ph = price_map.get(sym)
+            current_price = (_float(ph[0]) or _float(ph[1])) if ph else None
+
+            ar = analysis_map.get(sym)
             signal = ar[0] if ar else "UNKNOWN"
             raw_ar = ar[1] if ar else {}
             if not isinstance(raw_ar, dict):
