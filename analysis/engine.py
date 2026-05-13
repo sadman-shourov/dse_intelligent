@@ -2730,21 +2730,30 @@ def detect_institutional_accumulation(conn, target_date) -> list[dict]:
 
     results = []
 
+    candidate_symbols = [c[0] for c in candidates]
+    price_rows_map: dict[str, list] = {}
+    if candidate_symbols:
+        cur_bulk = conn.cursor()
+        cur_bulk.execute("""
+            SELECT symbol, close, volume, value
+            FROM (
+                SELECT symbol, close, volume, value,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
+                FROM price_history
+                WHERE symbol = ANY(%s)
+                  AND date <= %s
+            ) t
+            WHERE rn <= 10
+            ORDER BY symbol, rn
+        """, (candidate_symbols, target_date))
+        for sym, close, volume, value in cur_bulk.fetchall():
+            price_rows_map.setdefault(sym, []).append((close, volume, value))
+        cur_bulk.close()
+
     for symbol, stock_class, signal, raw, rsi_col in candidates:
         raw = raw or {}
 
-        # Get last 10 sessions
-        cur2 = conn.cursor()
-        cur2.execute("""
-            SELECT close, volume, value
-            FROM price_history
-            WHERE symbol = %s
-              AND date <= %s
-            ORDER BY date DESC
-            LIMIT 10
-        """, (symbol, target_date))
-        rows = cur2.fetchall()
-        cur2.close()
+        rows = price_rows_map.get(symbol, [])
 
         if len(rows) < 7:
             continue
