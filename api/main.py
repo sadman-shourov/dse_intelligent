@@ -1355,6 +1355,36 @@ def get_portfolio(trader_id: int):
         total_current_value = 0.0
         urgent_exits = 0
 
+        open_symbols = [row[0] for row in holdings]
+        analysis_map: dict[str, tuple] = {}
+        price_map: dict[str, tuple] = {}
+        if open_symbols:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (symbol)
+                    symbol, overall_signal, raw_output
+                FROM analysis_results
+                WHERE symbol = ANY(%s) AND analysis_date = CURRENT_DATE
+                ORDER BY symbol, session_no DESC NULLS LAST, id DESC
+                """,
+                (open_symbols,),
+            )
+            for sym_a, sig_a, raw_a in cur.fetchall():
+                analysis_map[sym_a] = (sig_a, raw_a)
+
+            cur.execute(
+                """
+                SELECT DISTINCT ON (symbol)
+                    symbol, ltp, close
+                FROM price_history
+                WHERE symbol = ANY(%s)
+                ORDER BY symbol, date DESC
+                """,
+                (open_symbols,),
+            )
+            for sym_p, ltp_p, close_p in cur.fetchall():
+                price_map[sym_p] = (ltp_p, close_p)
+
         for row in holdings:
             if "target_price" in ph_cols:
                 sym, qty, avg_px, invested, tgt_px = row[0], row[1], row[2], row[3], row[4]
@@ -1366,42 +1396,22 @@ def get_portfolio(trader_id: int):
             invested = float(invested or 0)
             tgt_px = _float(tgt_px) if tgt_px is not None else None
 
-            # Today's analysis price (live tick in raw_output) with price_history fallback
-            cur.execute(
-                """
-                SELECT
-                    ar.overall_signal,
-                    COALESCE(
-                        NULLIF(trim(ar.raw_output->>'current_price'), '')::numeric,
-                        ph.ltp,
-                        ph.close
-                    ) AS current_price
-                FROM (SELECT 1) AS _
-                LEFT JOIN LATERAL (
-                    SELECT overall_signal, raw_output
-                    FROM analysis_results
-                    WHERE symbol = %s AND analysis_date = CURRENT_DATE
-                    ORDER BY session_no DESC NULLS LAST, id DESC
-                    LIMIT 1
-                ) ar ON TRUE
-                LEFT JOIN LATERAL (
-                    SELECT ltp, close
-                    FROM price_history
-                    WHERE symbol = %s
-                    ORDER BY date DESC
-                    LIMIT 1
-                ) ph ON TRUE
-                """,
-                (sym, sym),
-            )
-            row_px = cur.fetchone()
-            signal = "HOLD"
+            sig_a, raw_a = analysis_map.get(sym, (None, None))
+            ltp_p, close_p = price_map.get(sym, (None, None))
+
+            signal = sig_a or "HOLD"
             current_price = avg_px
-            if row_px:
-                signal = row_px[0] or "HOLD"
-                cp = _float(row_px[1])
-                if cp is not None:
-                    current_price = cp
+            raw_price = None
+            if isinstance(raw_a, dict):
+                rp = raw_a.get("current_price")
+                if isinstance(rp, str):
+                    rp = rp.strip()
+                    if rp == "":
+                        rp = None
+                raw_price = _float(rp) if rp is not None else None
+            cp = raw_price if raw_price is not None else (_float(ltp_p) if ltp_p is not None else _float(close_p))
+            if cp is not None:
+                current_price = cp
 
             current_value = round(qty * current_price, 2)
             pnl_value = round(current_value - invested, 2)
