@@ -2552,21 +2552,30 @@ def detect_pre_breakout_coiling(conn, target_date) -> list[dict]:
 
     results = []
 
+    candidate_symbols = [c[0] for c in candidates]
+    price_rows_map: dict[str, list] = {}
+    if candidate_symbols:
+        cur_bulk = conn.cursor()
+        cur_bulk.execute("""
+            SELECT symbol, close, volume, high, low
+            FROM (
+                SELECT symbol, close, volume, high, low,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
+                FROM price_history
+                WHERE symbol = ANY(%s)
+                  AND date <= %s
+            ) t
+            WHERE rn <= 5
+            ORDER BY symbol, rn
+        """, (candidate_symbols, target_date))
+        for sym, close, volume, high, low in cur_bulk.fetchall():
+            price_rows_map.setdefault(sym, []).append((close, volume, high, low))
+        cur_bulk.close()
+
     for symbol, stock_class, signal, raw in candidates:
         raw = raw or {}
 
-        # Get last 5 sessions of price history
-        cur2 = conn.cursor()
-        cur2.execute("""
-            SELECT close, volume, high, low
-            FROM price_history
-            WHERE symbol = %s
-              AND date <= %s
-            ORDER BY date DESC
-            LIMIT 5
-        """, (symbol, target_date))
-        rows = cur2.fetchall()
-        cur2.close()
+        rows = price_rows_map.get(symbol, [])
 
         if len(rows) < 5:
             continue
