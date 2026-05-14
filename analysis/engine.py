@@ -1542,6 +1542,20 @@ def determine_overall_signal(
     else:
         signal = "EXIT"
 
+    # Gold-standard filter: BUY signals are only allowed when the cohort has
+    # demonstrated edge in the backtest. INVESTMENT-class BUYs work at any
+    # confidence; TRADING-class BUYs only when score >= 75 (the highest
+    # bucket that shows meaningful win rate). GAMBLING is already blocked
+    # via hard_buy_blocked above. Downgrade rejected BUYs to WATCH so the
+    # idea is still surfaced for monitoring but no entry call is issued.
+    if signal == "BUY":
+        if stock_class == "TRADING" and score < 75:
+            signal = "WATCH"
+            score_breakdown["buy_downgraded_low_conf_trading"] = 1
+        elif stock_class not in ("INVESTMENT", "TRADING"):
+            signal = "WATCH"
+            score_breakdown["buy_downgraded_unknown_class"] = 1
+
     score_breakdown["total"] = int(round(score))
     return signal, round(score / 100.0, 2), int(confirming_signals), score_breakdown
 
