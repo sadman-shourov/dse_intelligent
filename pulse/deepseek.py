@@ -1896,7 +1896,7 @@ def build_proactive_pulse(
             setup_lines.append(
                 f"{s['symbol']} @ {s['current_price']}"
                 f" | Score {s['score']}/8 "
-                f"({s['confidence_pct']}%)\n"
+                f"(confidence: {_confidence_label(s.get('confidence_pct'))})\n"
                 f"Setup: {s['setup_type']}\n"
                 f"{support_str}\n"
                 f"{target_str}\n"
@@ -2021,6 +2021,94 @@ def get_session_label(session_no: int) -> str:
     return "Market Update"
 
 
+def _confidence_label(conf_pct: float | int | None) -> str:
+    """Bucket a 0-100 confidence percentage into Low/Medium/High. Our data has
+    only 3 effective confidence levels (0.6, 0.7, 0.8); a 2-digit percentage
+    implies precision we have not earned yet."""
+    if conf_pct is None:
+        return "Medium"
+    try:
+        c = float(conf_pct)
+    except (TypeError, ValueError):
+        return "Medium"
+    if c < 65:
+        return "Low"
+    if c < 75:
+        return "Medium"
+    return "High"
+
+
+def _compute_track_record_line(conn) -> str:
+    """Pull last-30-day BUY outcome stats from signal_outcomes for an honest
+    one-line disclaimer. Returns empty string if not enough data."""
+    if conn is None:
+        return ""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE outcome != 'PENDING') AS evaluated,
+                   COUNT(*) FILTER (WHERE outcome = 'WIN')      AS wins,
+                   COUNT(DISTINCT signal_date)                  AS days,
+                   MIN(signal_date)
+            FROM signal_outcomes
+            WHERE signal_type = 'BUY'
+              AND signal_date >= CURRENT_DATE - INTERVAL '30 days'
+            """
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return ""
+        evaluated, wins, days, _earliest = row
+        evaluated = int(evaluated or 0)
+        days = int(days or 0)
+        if evaluated < 10:
+            return f"📊 Track record: {evaluated} evaluated BUYs over {days}d — sample too small to report win rate."
+        win_pct = (int(wins or 0) / evaluated) * 100.0
+        return f"📊 Track record: {evaluated} BUYs over {days}d · win rate {win_pct:.0f}% (still calibrating)"
+    except Exception:
+        logger.debug("track-record line query failed", exc_info=True)
+        return ""
+
+
+def _mandatory_exit_block(portfolio: list) -> str:
+    """Deterministic stop-loss enforcement: any position with pnl_pct <= -8 must
+    appear as a hard EXIT in the message, regardless of what the LLM said. The
+    rule lives in code so a prompt change can never silently soften it."""
+    if not portfolio:
+        return ""
+    flagged = []
+    for p in portfolio:
+        try:
+            pnl = float(p.get("pnl_pct") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if pnl <= -8.0:
+            flagged.append(p)
+    if not flagged:
+        return ""
+    lines = ["⛔ MANDATORY EXIT (auto-enforced -8% stop loss):"]
+    for p in flagged:
+        sym = p.get("symbol") or "?"
+        try:
+            pnl = float(p.get("pnl_pct") or 0.0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        cp = p.get("current_price")
+        ap = p.get("avg_buy_price")
+        try:
+            cp_f = float(cp) if cp is not None else None
+            ap_f = float(ap) if ap is not None else None
+        except (TypeError, ValueError):
+            cp_f = ap_f = None
+        cp_s = f"{cp_f:.2f}" if cp_f is not None else "—"
+        ap_s = f"{ap_f:.2f}" if ap_f is not None else "—"
+        lines.append(f"• {sym}: {pnl:+.1f}% (now {cp_s}, avg {ap_s}) — EXIT NOW")
+    lines.append("This is a hard rule, not a suggestion.")
+    return "\n".join(lines)
+
+
 def format_telegram_message(
     deepseek_response: str,
     analysis: dict,
@@ -2031,8 +2119,9 @@ def format_telegram_message(
     **kwargs: Any,
 ) -> str:
     """Wrap DeepSeek plain-text body in Telegram HTML header/footer."""
-    _ = analysis, portfolio
+    _ = analysis
     pulse_type = kwargs.pop("pulse_type", None)
+    track_record_line = kwargs.pop("track_record_line", "") or ""
     kwargs.pop("scorecard", None)
     kwargs.pop("proactive_now_count", None)
 
@@ -2040,6 +2129,10 @@ def format_telegram_message(
     deepseek_response = re.sub(r"\*\*(.*?)\*\*", r"\1", body_raw)
     deepseek_response = re.sub(r"\*(.*?)\*", r"\1", deepseek_response)
     deepseek_response = re.sub(r"__(.*?)__", r"\1", deepseek_response)
+
+    mandatory = _mandatory_exit_block(portfolio or [])
+    if mandatory:
+        deepseek_response = f"{mandatory}\n\n{deepseek_response}".strip()
 
     day_str = target_date.strftime("%a %d %b")
     if session_no == -1:
@@ -2079,9 +2172,11 @@ def format_telegram_message(
             f"📅 {day_str} · {session_str}"
         )
 
+    footer_extra = f"\n{html.escape(track_record_line)}" if track_record_line else ""
     message = (
         f"{head_block}\n\n{deepseek_response}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "━━━━━━━━━━━━━━━━━━━━━"
+        f"{footer_extra}\n"
         "<i>🤖 Powered by NexTrade</i>"
     )
 
@@ -2356,6 +2451,7 @@ def generate_pulse(trader_id: int) -> dict:
                 session_no,
                 send_reason,
                 pulse_type=use_pulse_type_e,
+                track_record_line=_compute_track_record_line(conn),
             )
             try:
                 _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -2397,6 +2493,7 @@ def generate_pulse(trader_id: int) -> dict:
             session_no,
             send_reason,
             pulse_type=use_pulse_type,
+            track_record_line=_compute_track_record_line(conn),
         )
         try:
             _insert_pulse_log(conn, trader_id, target_date, session_no, deepseek_input, deepseek_output)
@@ -2577,7 +2674,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             res = b["resistance"]
             sup = b["support"]
             lines.append(
-                f"- {b['symbol']} @ {cp} | Confidence: {conf_pct:.0f}%\n"
+                f"- {b['symbol']} @ {cp} | Confidence: {_confidence_label(conf_pct)}\n"
                 f"  Key resistance: {res[0] if res else 'N/A'} | "
                 f"Key support: {sup[0] if sup else 'N/A'}"
             )
