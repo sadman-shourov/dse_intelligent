@@ -445,6 +445,59 @@ def _deliver_pulse_for_trader(t: dict[str, Any], target_date) -> tuple[int, int,
             pass
 
 
+def _should_skip_duplicate_pulse(conn, trader_id: int, target_date: date) -> bool:
+    """Suppress a fresh pulse when one was sent in the last 2 hours for the same
+    trader and date, unless the trader has any urgent (<=-8% P&L) position —
+    those always warrant a fresh alert. Returns True if the caller should skip
+    generating + sending this pulse cycle."""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT 1 FROM pulse_log
+            WHERE trader_id = %s
+              AND pulse_date = %s
+              AND telegram_sent = TRUE
+              AND sent_at IS NOT NULL
+              AND sent_at >= NOW() - INTERVAL '2 hours'
+            LIMIT 1
+            """,
+            (trader_id, target_date),
+        )
+        recent = cur.fetchone() is not None
+        if not recent:
+            return False
+
+        cur.execute(
+            """
+            SELECT ph.symbol, ph.avg_buy_price,
+                   COALESCE(p.ltp, p.close) AS current_price
+            FROM portfolio_holdings ph
+            LEFT JOIN LATERAL (
+                SELECT ltp, close FROM price_history
+                WHERE symbol = ph.symbol
+                ORDER BY date DESC LIMIT 1
+            ) p ON TRUE
+            WHERE ph.trader_id = %s AND ph.is_open = TRUE
+            """,
+            (trader_id,),
+        )
+        for _sym, avg_px, cur_px in cur.fetchall():
+            try:
+                a = float(avg_px or 0)
+                c = float(cur_px or 0)
+                if a > 0 and c > 0 and (c - a) / a <= -0.08:
+                    return False
+            except (TypeError, ValueError):
+                continue
+        return True
+    except Exception:
+        logger.exception("_should_skip_duplicate_pulse failed for trader %s", trader_id)
+        return False
+    finally:
+        cur.close()
+
+
 def deliver_pulse_if_needed() -> dict[str, Any]:
     """Generate proactive pulses for active traders and send only when actionable."""
     load_env()
@@ -476,6 +529,11 @@ def deliver_pulse_if_needed() -> dict[str, Any]:
             if not chat:
                 skipped += 1
                 details.append({"trader_id": tid, "name": name, "status": "skipped", "reason": "no_chat_id"})
+                continue
+
+            if _should_skip_duplicate_pulse(conn, tid, target_date):
+                skipped += 1
+                details.append({"trader_id": tid, "name": name, "status": "skipped", "reason": "duplicate_recent_pulse"})
                 continue
 
             try:
