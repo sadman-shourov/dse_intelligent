@@ -242,7 +242,7 @@ def _pulse_output_is_sendable(deepseek_output: str) -> bool:
         except json.JSONDecodeError:
             pass
     head = s[:400].lower()
-    if "deepseek api error" in head or s.lower().startswith("pulse error:"):
+    if "openrouter api error" in head or "deepseek api error" in head or s.lower().startswith("pulse error:"):
         return False
     return True
 

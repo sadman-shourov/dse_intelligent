@@ -231,7 +231,7 @@ def root():
             # Pulse
             {"path": "/pulse/deliver/all", "method": "POST", "description": "Deliver latest pulse to all active traders via Telegram"},
             {"path": "/pulse/deliver/{trader_id}", "method": "POST", "description": "Deliver latest pulse to one trader via Telegram"},
-            {"path": "/pulse/generate/{trader_id}", "method": "POST", "description": "Generate DeepSeek market pulse + Telegram message for a trader"},
+            {"path": "/pulse/generate/{trader_id}", "method": "POST", "description": "Generate OpenRouter LLM market pulse + Telegram message for a trader"},
             {"path": "/pulse/premarket/deliver/all", "method": "POST", "description": "Generate and send pre-market briefing to all active traders"},
             {"path": "/pulse/premarket/{trader_id}", "method": "POST", "description": "Generate and send pre-market briefing to one trader"},
             # Chatbot

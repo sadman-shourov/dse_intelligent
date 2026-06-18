@@ -24,7 +24,8 @@ pip3 install -r requirements.txt --break-system-packages
 # Create .env file (fill in values manually after)
 cat > /var/www/aria/.env << 'EOF'
 DATABASE_URL=
-DEEPSEEK_API_KEY=
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=deepseek/deepseek-v4-pro
 TELEGRAM_BOT_TOKEN=
 EOF
 

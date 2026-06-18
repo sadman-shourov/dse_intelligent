@@ -1981,13 +1981,21 @@ def build_proactive_pulse(
 def call_deepseek(system_message: str, user_message: str, temperature: float = 0.3) -> str:
     from openai import OpenAI
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key or not api_key.strip():
-        raise RuntimeError("DEEPSEEK_API_KEY is missing or empty in .env")
+        raise RuntimeError("OPENROUTER_API_KEY is missing or empty in .env")
 
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    model = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-pro").strip()
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "https://github.com/sadman-shourov/aria",
+            "X-Title": "ARIA DSE Pulse",
+        },
+    )
     response = client.chat.completions.create(
-        model="deepseek-chat",
+        model=model,
         messages=[
             {"role": "system", "content": system_message},
             {"role": "user", "content": user_message},
@@ -2438,7 +2446,7 @@ def generate_pulse(trader_id: int) -> dict:
         try:
             deepseek_output = call_deepseek(system_msg, user_msg)
         except Exception as e:
-            deepseek_output = f"DeepSeek API error: {e}\n{traceback.format_exc()}"
+            deepseek_output = f"OpenRouter API error: {e}\n{traceback.format_exc()}"
             use_pulse_type_e = (
                 "eod" if (pulse_type == "eod" and send_reason not in alert_reasons)
                 else None
@@ -2725,7 +2733,7 @@ def generate_premarket_briefing(trader_id: int) -> dict:
         try:
             deepseek_output = call_deepseek(system_msg, user_msg, temperature=0.2)
         except Exception as e:
-            deepseek_output = f"DeepSeek API error: {e}"
+            deepseek_output = f"OpenRouter API error: {e}"
 
         # --- Format Telegram message (shared header/footer with pulse formatter) ---
         premarket_analysis = {
