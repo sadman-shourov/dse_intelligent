@@ -759,6 +759,12 @@ def get_forming_setups():
             "count": len(setups),
             "forming_setups": setups,
         }
+    except Exception as e:
+        logger.exception("get_forming_setups error")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
     finally:
         conn.close()
 
@@ -776,6 +782,12 @@ def get_coiling_setups():
             "count": len(setups),
             "coiling_setups": setups,
         }
+    except Exception as e:
+        logger.exception("get_coiling_setups error")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
     finally:
         conn.close()
 
@@ -794,6 +806,12 @@ def get_accumulation_setups():
             "count": len(setups),
             "accumulation_setups": setups,
         }
+    except Exception as e:
+        logger.exception("get_accumulation_setups error")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
     finally:
         conn.close()
 
@@ -844,6 +862,12 @@ def get_all_predictive_signals():
                 len(forming) + len(coiling) + len(accumulation)
             )
         }
+    except Exception as e:
+        logger.exception("get_all_predictive_signals error")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
     finally:
         conn.close()
 

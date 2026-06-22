@@ -27,6 +27,17 @@ def _to_float(val):
         return None
 
 
+def _positive_float_list(values) -> list[float] | None:
+    """Return positive finite floats, or None when any market value is invalid."""
+    cleaned: list[float] = []
+    for value in values:
+        number = _to_float(value)
+        if number is None or not np.isfinite(number) or number <= 0:
+            return None
+        cleaned.append(number)
+    return cleaned
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -2417,8 +2428,9 @@ def detect_forming_setups(
         support_score = 0
 
         if support_levels:
-            valid = [s for s in support_levels 
-                    if isinstance(s, (int, float)) and float(s) < current_price]
+            valid = [s for s in support_levels
+                    if isinstance(s, (int, float))
+                    and 0 < float(s) < current_price]
             if valid:
                 nearest_support = max(valid)
                 distance_to_support_pct = round(
@@ -2578,6 +2590,9 @@ def detect_pre_breakout_coiling(conn, target_date) -> list[dict]:
                 FROM price_history
                 WHERE symbol = ANY(%s)
                   AND date <= %s
+                  AND close > 0
+                  AND high > 0
+                  AND low > 0
             ) t
             WHERE rn <= 5
             ORDER BY symbol, rn
@@ -2594,18 +2609,19 @@ def detect_pre_breakout_coiling(conn, target_date) -> list[dict]:
         if len(rows) < 5:
             continue
 
-        closes = [_to_float(r[0]) for r in rows]
-        volumes = [_to_float(r[1]) for r in rows]
-        highs = [_to_float(r[2]) for r in rows]
-        lows = [_to_float(r[3]) for r in rows]
+        closes = _positive_float_list(r[0] for r in rows)
+        volumes = [(_to_float(r[1]) or 0.0) for r in rows]
+        highs = _positive_float_list(r[2] for r in rows)
+        lows = _positive_float_list(r[3] for r in rows)
 
-        if not closes or closes[0] == 0:
+        if not closes or not highs or not lows:
             continue
 
         current_price = closes[0]
 
         # Condition 1: Tight price range < 3% over 5 sessions
-        price_range_pct = (max(highs) - min(lows)) / min(lows) * 100
+        lowest_low = min(lows)
+        price_range_pct = (max(highs) - lowest_low) / lowest_low * 100
         tight_range = price_range_pct < 3.0
 
         # Condition 2: Volume declining (energy coiling)
@@ -2685,7 +2701,7 @@ def detect_pre_breakout_coiling(conn, target_date) -> list[dict]:
         if support_levels:
             valid_sup = [s for s in support_levels
                         if isinstance(s, (int, float))
-                        and float(s) < current_price]
+                        and 0 < float(s) < current_price]
             if valid_sup:
                 nearest_support = max(valid_sup)
 
@@ -2756,6 +2772,7 @@ def detect_institutional_accumulation(conn, target_date) -> list[dict]:
                 FROM price_history
                 WHERE symbol = ANY(%s)
                   AND date <= %s
+                  AND close > 0
             ) t
             WHERE rn <= 10
             ORDER BY symbol, rn
@@ -2772,13 +2789,13 @@ def detect_institutional_accumulation(conn, target_date) -> list[dict]:
         if len(rows) < 7:
             continue
 
-        closes = [_to_float(r[0]) for r in rows]
-        volumes = [_to_float(r[1]) for r in rows]
+        closes = _positive_float_list(r[0] for r in rows)
+        volumes = [(_to_float(r[1]) or 0.0) for r in rows]
         values = [(_to_float(r[2]) or 0) for r in rows]
 
-        current_price = closes[0]
-        if current_price == 0:
+        if not closes:
             continue
+        current_price = closes[0]
 
         # Condition 1: Price flat or slightly down over 5 sessions
         price_5d_change = (closes[0] - closes[4]) / closes[4] * 100
