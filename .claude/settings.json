@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git check-ignore *)",
+      "Bash(curl -s -m 20 \"https://piloting-intellegnce.p-stageenv.xyz/health\")",
+      "Bash(curl -s -m 20 -o /dev/null -w \"health/data -> HTTP %{http_code}\\\\n\" \"https://piloting-intellegnce.p-stageenv.xyz/health/data\")"
+    ]
+  }
+}
