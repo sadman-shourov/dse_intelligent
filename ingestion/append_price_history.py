@@ -58,8 +58,9 @@ def append_price_history() -> dict:
     if not database_url or not database_url.strip():
         raise RuntimeError("DATABASE_URL is missing or empty in .env")
 
-    import bdshare  # type: ignore
+    from ingestion.dse_client import get_bdshare_client
 
+    bdshare = get_bdshare_client()
     conn = psycopg2.connect(database_url)
     conn.autocommit = True
     target_date = get_db_date(conn)

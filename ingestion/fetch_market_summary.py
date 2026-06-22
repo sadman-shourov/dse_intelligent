@@ -49,7 +49,9 @@ def fetch_market_summary() -> dict:
     conn.autocommit = True
     target_date = get_db_date(conn)
 
-    import bdshare  # type: ignore
+    from ingestion.dse_client import get_bdshare_client
+
+    bdshare = get_bdshare_client()
     df = bdshare.get_market_info()
     if df is None or (hasattr(df, "empty") and df.empty):
         conn.close()

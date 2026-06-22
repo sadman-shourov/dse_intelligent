@@ -262,12 +262,12 @@ def root():
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest/sync-stocks")
-async def ingest_sync_stocks(request: Request):
+def ingest_sync_stocks(request: Request):
     return _run_job(sync_stocks_master)
 
 
 @app.post("/ingest/append-price-history")
-async def ingest_append_price_history(request: Request):
+def ingest_append_price_history(request: Request):
     return _run_job(append_price_history)
 
 
@@ -391,7 +391,7 @@ def ingest_live_ticks_endpoint():
 
 
 @app.post("/ingest/cleanup-live-ticks")
-async def ingest_cleanup_live_ticks(request: Request):
+def ingest_cleanup_live_ticks(request: Request):
     return _run_job(cleanup_live_ticks)
 
 
@@ -577,12 +577,12 @@ def pipeline_failure_alert():
 
 
 @app.post("/ingest/market-summary")
-async def ingest_market_summary(request: Request):
+def ingest_market_summary(request: Request):
     return _run_job(fetch_market_summary)
 
 
 @app.post("/ingest/stock-fundamentals")
-async def ingest_stock_fundamentals(request: Request):
+def ingest_stock_fundamentals(request: Request):
     return _run_job(fetch_stock_fundamentals)
 
 

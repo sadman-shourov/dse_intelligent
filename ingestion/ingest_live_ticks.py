@@ -61,7 +61,9 @@ def ingest_live_ticks() -> dict:
             "details": {},
         }
 
-    import bdshare  # type: ignore
+    from ingestion.dse_client import get_bdshare_client
+
+    bdshare = get_bdshare_client()
     trade_data = bdshare.get_current_trade_data()
     if trade_data is None or (hasattr(trade_data, "empty") and trade_data.empty):
         raise RuntimeError("bdshare total failure: get_current_trade_data() returned empty.")

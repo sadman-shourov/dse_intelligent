@@ -47,7 +47,9 @@ def fetch_stock_fundamentals() -> dict:
         cur.execute("SELECT CURRENT_DATE")
         fetched_at = cur.fetchone()[0]
 
-        import bdshare  # type: ignore
+        from ingestion.dse_client import get_bdshare_client
+
+        bdshare = get_bdshare_client()
         df = bdshare.get_latest_pe()
         if df is None or (hasattr(df, "empty") and df.empty):
             raise RuntimeError("bdshare total failure: get_latest_pe() returned empty.")

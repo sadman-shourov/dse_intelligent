@@ -2,31 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
-from typing import Callable, Iterable, TypeVar
+from typing import Iterable
 
 import psycopg2
 from dotenv import load_dotenv
 
-T = TypeVar("T")
-
-
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
-
-
-def _call_with_retries(label: str, fn: Callable[[], T], attempts: int = 3, sleep_s: float = 2.0) -> T:
-    last_err: Exception | None = None
-    for i in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last_err = e
-            if i < attempts:
-                time.sleep(sleep_s)
-    assert last_err is not None
-    raise RuntimeError(f"{label} failed after {attempts} attempts: {last_err}")
 
 
 def _normalize_symbols(raw: Iterable) -> list[str]:
@@ -108,14 +91,15 @@ def sync_stocks_master() -> dict:
     if not database_url or not database_url.strip():
         raise RuntimeError("DATABASE_URL is missing or empty in .env")
 
-    import bdshare  # type: ignore
+    from ingestion.dse_client import get_bdshare_client
 
-    all_symbols_raw = _call_with_retries("bdshare.get_current_trading_code()", lambda: bdshare.get_current_trading_code())
+    bdshare = get_bdshare_client()
+    all_symbols_raw = bdshare.get_current_trading_code()
     all_symbols = _extract_all_symbols(all_symbols_raw)
     if not all_symbols:
         raise RuntimeError("bdshare.get_current_trading_code() returned 0 symbols")
 
-    dsex_data = _call_with_retries("bdshare.get_dsex_data()", lambda: bdshare.get_dsex_data())
+    dsex_data = bdshare.get_dsex_data()
     dsex_symbols = _extract_dsex_symbols(dsex_data)
 
     inserted = 0

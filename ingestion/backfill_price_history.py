@@ -119,7 +119,9 @@ def backfill_price_history() -> None:
             raise RuntimeError("DATABASE_URL is missing or empty in .env")
 
         try:
-            import bdshare  # type: ignore
+            from ingestion.dse_client import get_bdshare_client
+
+            bdshare = get_bdshare_client()
         except Exception as e:
             raise RuntimeError("bdshare is not installed. Run: pip install -r requirements.txt") from e
 
