@@ -240,6 +240,7 @@ def root():
             {"path": "/portfolio/{trader_id}", "method": "GET", "description": "Trader's current portfolio with P&L"},
             {"path": "/portfolio/{trader_id}/buy", "method": "POST", "description": "Record a buy trade"},
             {"path": "/portfolio/{trader_id}/sell", "method": "POST", "description": "Record a sell trade"},
+            {"path": "/portfolio/{trader_id}/import", "method": "POST", "description": "Bulk import/upsert current portfolio holdings"},
             {"path": "/watchlist/{trader_id}", "method": "GET", "description": "Trader's watchlist with current signals"},
             {"path": "/watchlist/{trader_id}/add", "method": "POST", "description": "Add a stock to watchlist"},
             {"path": "/watchlist/{trader_id}/remove", "method": "POST", "description": "Remove a stock from watchlist"},
@@ -1610,6 +1611,266 @@ async def record_buy(trader_id: int, request: Request):
         logger.exception("record_buy error trader_id=%s", trader_id)
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/portfolio/{trader_id}/import")
+async def import_portfolio(trader_id: int, request: Request):
+    """Bulk upsert current holdings from chat/broker portfolio text.
+
+    This endpoint treats the payload as the trader's current holding snapshot for
+    the supplied symbols. It updates portfolio_holdings idempotently and does not
+    create trade_transactions unless record_transactions=true is explicitly sent.
+    """
+    conn = None
+    cur = None
+    try:
+        body = await request.json()
+        positions_raw = (
+            body.get("positions")
+            or body.get("holdings")
+            or body.get("portfolio")
+            or []
+        )
+        if isinstance(positions_raw, dict):
+            positions_raw = list(positions_raw.values())
+        if not isinstance(positions_raw, list) or not positions_raw:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Invalid input",
+                    "message": "Required field: positions (non-empty array)",
+                },
+            )
+
+        source = (body.get("source") or "chat_portfolio_import").strip()
+        notes_prefix = (body.get("notes") or source).strip()
+        close_missing = bool(body.get("close_missing", False))
+        record_transactions = bool(body.get("record_transactions", False))
+        trade_date_raw = body.get("date")
+
+        conn = _get_conn()
+        conn.autocommit = False
+        cur = conn.cursor()
+        today = _get_db_date(conn)
+        import_date = date.fromisoformat(trade_date_raw) if trade_date_raw else today
+
+        cur.execute("SELECT 1 FROM traders WHERE id = %s", (trader_id,))
+        if not cur.fetchone():
+            conn.rollback()
+            return _trader_not_found_response(trader_id)
+
+        cur.execute("SELECT symbol FROM stocks_master")
+        valid_symbols = {str(r[0]).upper() for r in cur.fetchall()}
+
+        imported: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        seen_symbols: set[str] = set()
+
+        for idx, raw_pos in enumerate(positions_raw):
+            if not isinstance(raw_pos, dict):
+                skipped.append({"index": idx, "reason": "position is not an object", "position": raw_pos})
+                continue
+
+            symbol = str(
+                raw_pos.get("symbol")
+                or raw_pos.get("stock")
+                or raw_pos.get("ticker")
+                or ""
+            ).upper().strip()
+            quantity = _int(
+                raw_pos.get("quantity")
+                or raw_pos.get("qty")
+                or raw_pos.get("total_qty")
+                or raw_pos.get("shares")
+            )
+            avg_buy_price = _float(
+                raw_pos.get("avg_buy_price")
+                or raw_pos.get("avg_price")
+                or raw_pos.get("avg_cost")
+                or raw_pos.get("average_price")
+                or raw_pos.get("price")
+            )
+            total_cost = _float(
+                raw_pos.get("total_cost")
+                or raw_pos.get("total_invested")
+                or raw_pos.get("cost")
+                or raw_pos.get("total_value")
+            )
+            target_price = _float(raw_pos.get("target_price"))
+            row_notes = raw_pos.get("notes") or notes_prefix
+
+            if not symbol:
+                skipped.append({"index": idx, "reason": "missing symbol", "position": raw_pos})
+                continue
+            if symbol not in valid_symbols:
+                skipped.append({"index": idx, "symbol": symbol, "reason": "unknown DSE symbol"})
+                continue
+            if not quantity or quantity <= 0:
+                skipped.append({"index": idx, "symbol": symbol, "reason": "quantity must be > 0"})
+                continue
+            if (avg_buy_price is None or avg_buy_price <= 0) and total_cost and total_cost > 0:
+                avg_buy_price = round(total_cost / quantity, 2)
+            if avg_buy_price is None or avg_buy_price <= 0:
+                skipped.append({"index": idx, "symbol": symbol, "reason": "avg_buy_price/price must be > 0"})
+                continue
+
+            if total_cost is None or total_cost <= 0:
+                total_cost = round(quantity * avg_buy_price, 2)
+            else:
+                total_cost = round(total_cost, 2)
+            avg_buy_price = round(avg_buy_price, 2)
+            seen_symbols.add(symbol)
+
+            cur.execute(
+                """
+                SELECT id FROM portfolio_holdings
+                WHERE trader_id = %s AND symbol = %s
+                """,
+                (trader_id, symbol),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE portfolio_holdings
+                    SET quantity = %s,
+                        avg_buy_price = %s,
+                        total_invested = %s,
+                        first_bought_at = COALESCE(first_bought_at, %s),
+                        last_updated = %s,
+                        is_open = TRUE,
+                        notes = %s,
+                        target_price = COALESCE(%s, target_price),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        quantity,
+                        avg_buy_price,
+                        total_cost,
+                        import_date,
+                        today,
+                        row_notes,
+                        target_price,
+                        existing[0],
+                    ),
+                )
+                action = "updated"
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO portfolio_holdings
+                        (trader_id, symbol, quantity, avg_buy_price, total_invested,
+                         first_bought_at, last_updated, is_open, notes, target_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+                    """,
+                    (
+                        trader_id,
+                        symbol,
+                        quantity,
+                        avg_buy_price,
+                        total_cost,
+                        import_date,
+                        today,
+                        row_notes,
+                        target_price,
+                    ),
+                )
+                action = "inserted"
+
+            if record_transactions:
+                cur.execute(
+                    """
+                    INSERT INTO trade_transactions
+                        (trader_id, symbol, transaction_type, quantity, price, total_value, transaction_date, notes)
+                    VALUES (%s, %s, 'BUY', %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        trader_id,
+                        symbol,
+                        quantity,
+                        avg_buy_price,
+                        total_cost,
+                        import_date,
+                        f"{notes_prefix} import snapshot",
+                    ),
+                )
+
+            imported.append(
+                {
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "avg_buy_price": avg_buy_price,
+                    "total_invested": total_cost,
+                    "target_price": target_price,
+                    "action": action,
+                }
+            )
+
+        closed_missing: list[str] = []
+        if close_missing and seen_symbols:
+            cur.execute(
+                """
+                SELECT symbol FROM portfolio_holdings
+                WHERE trader_id = %s AND is_open = TRUE
+                """,
+                (trader_id,),
+            )
+            currently_open = {str(r[0]).upper() for r in cur.fetchall()}
+            to_close = sorted(currently_open - seen_symbols)
+            if to_close:
+                cur.execute(
+                    """
+                    UPDATE portfolio_holdings
+                    SET quantity = 0,
+                        total_invested = 0,
+                        is_open = FALSE,
+                        last_updated = %s,
+                        updated_at = NOW()
+                    WHERE trader_id = %s AND symbol = ANY(%s)
+                    """,
+                    (today, trader_id, to_close),
+                )
+                closed_missing = to_close
+
+        if not imported:
+            conn.rollback()
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "No valid positions to import",
+                    "imported_count": 0,
+                    "skipped_count": len(skipped),
+                    "skipped": skipped,
+                },
+            )
+
+        conn.commit()
+        return {
+            "status": "ok",
+            "message": f"Imported {len(imported)} portfolio position(s)",
+            "trader_id": trader_id,
+            "imported_count": len(imported),
+            "skipped_count": len(skipped),
+            "closed_missing_count": len(closed_missing),
+            "imported": imported,
+            "skipped": skipped,
+            "closed_missing": closed_missing,
+        }
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.exception("import_portfolio error trader_id=%s", trader_id)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
         if conn:
             conn.close()
 
