@@ -1057,11 +1057,11 @@ def deliver_premarket_briefing(trader_id: int | None = None) -> dict:
                         """
                         UPDATE pulse_log SET telegram_sent = TRUE, sent_at = NOW()
                         WHERE trader_id = %s AND pulse_date = CURRENT_DATE
-                          AND session_no = 0
+                          AND session_no = -1
                           AND id = (
                               SELECT id FROM pulse_log
                               WHERE trader_id = %s AND pulse_date = CURRENT_DATE
-                                AND session_no = 0
+                                AND session_no = -1
                               ORDER BY id DESC LIMIT 1
                           )
                         """,

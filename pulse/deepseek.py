@@ -2019,6 +2019,74 @@ def _plain_text_for_telegram_body(model_text: str) -> str:
     return t.strip()
 
 
+def _premarket_fallback_body(
+    *,
+    dsex: float | None,
+    dsex_change: float | None,
+    volume: int | None,
+    value_mn: float | None,
+    buy_signals: list[dict],
+    portfolio: list[dict],
+    watchlist: list[dict],
+) -> str:
+    """Deterministic pre-market body used when the LLM returns no usable text."""
+    lines: list[str] = [
+        "OpenRouter returned no written briefing, so here is the system-generated fallback.",
+        "",
+        "Market context:",
+    ]
+
+    if dsex is not None:
+        chg = f" ({dsex_change:+.2f}%)" if dsex_change is not None else ""
+        lines.append(f"- DSEX previous close: {dsex:.2f}{chg}")
+        if volume is not None or value_mn is not None:
+            vol = f"{volume:,}" if volume is not None else "N/A"
+            val = f"{value_mn:.2f}mn" if value_mn is not None else "N/A"
+            lines.append(f"- Volume: {vol} | Value: {val}")
+    else:
+        lines.append("- Previous market summary unavailable.")
+
+    lines.append("")
+    lines.append("Top BUY signals from the last analysis:")
+    if buy_signals:
+        for b in buy_signals[:5]:
+            cp = b.get("current_price") or "N/A"
+            conf_pct = (b.get("confidence") or 0.0) * 100
+            res = b.get("resistance") or []
+            sup = b.get("support") or []
+            lines.append(
+                f"- {b.get('symbol')}: price {cp}, confidence {_confidence_label(conf_pct)}, "
+                f"resistance {res[0] if res else 'N/A'}, support {sup[0] if sup else 'N/A'}"
+            )
+    else:
+        lines.append("- None available.")
+
+    lines.append("")
+    if portfolio:
+        lines.append("Portfolio focus:")
+        for p in portfolio:
+            pnl = float(p.get("pnl_pct") or 0)
+            if pnl <= -8:
+                action = "stop-loss breached; review exit at open"
+            elif pnl <= -6:
+                action = "near stop-loss; watch closely"
+            else:
+                action = "hold discipline; no forced action"
+            lines.append(f"- {p.get('symbol')}: P&L {pnl:+.1f}% — {action}.")
+    else:
+        lines.append("Portfolio focus: no open positions.")
+
+    lines.append("")
+    if watchlist:
+        lines.append("Watchlist:")
+        for w in watchlist[:8]:
+            lines.append(f"- {w.get('symbol')}: target {w.get('target_price')}, signal {w.get('signal')}")
+    else:
+        lines.append("Watchlist: empty. Add watchlist stocks for a sharper pre-market brief.")
+
+    return "\n".join(lines).strip()
+
+
 def get_session_label(session_no: int) -> str:
     if session_no == -1:
         return "Pre-Market Briefing"
@@ -2734,6 +2802,16 @@ def generate_premarket_briefing(trader_id: int) -> dict:
             deepseek_output = call_deepseek(system_msg, user_msg, temperature=0.2)
         except Exception as e:
             deepseek_output = f"OpenRouter API error: {e}"
+        if not _plain_text_for_telegram_body(deepseek_output).strip():
+            deepseek_output = _premarket_fallback_body(
+                dsex=dsex,
+                dsex_change=dsex_change,
+                volume=volume,
+                value_mn=value_mn,
+                buy_signals=buy_signals,
+                portfolio=portfolio,
+                watchlist=watchlist,
+            )
 
         # --- Format Telegram message (shared header/footer with pulse formatter) ---
         premarket_analysis = {

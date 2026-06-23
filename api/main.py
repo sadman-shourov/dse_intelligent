@@ -913,7 +913,7 @@ def pulse_endpoint(trader_id: int):
 
 
 @app.post("/pulse/premarket/deliver/all")
-async def premarket_deliver_all(request: Request):
+def premarket_deliver_all(request: Request):
     try:
         result = deliver_premarket_briefing()
         return serialize_response(result)
