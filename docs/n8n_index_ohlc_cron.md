@@ -62,11 +62,21 @@ after `Fetch Market Summary` is simplest and guarantees the final sample is in.
 ```
 
 - `status`: `ok` | `skipped` | `error`
-- `skipped` means no `index_ticks` were recorded today (holiday, or the
-  market-hours chain did not run). The job writes nothing — it never produces a
-  flat/garbage candle.
+- `skipped` means there were not enough samples to build a real candle — fewer
+  than 4 samples, or spread over less than 30 minutes. The job writes nothing,
+  so a flat/near-flat artifact never overwrites a real candle. This is the
+  correct, healthy result when you test the node off-hours (the market is closed,
+  so only one sample exists) or on a holiday.
 - `samples_today`: how many intraday samples fed the candle. More samples =
-  tighter high/low. If this is low, your market-hours chain ran few times.
+  tighter high/low. A normal trading day clears the guard easily. If a trading
+  day is skipped, your market-hours chain barely ran — investigate that.
+
+### Testing the node off-hours
+
+Clicking **Execute step** in n8n also runs the upstream Fetch Market Summary,
+which records one sample. With a single off-hours sample the rollup returns
+`skipped` (guard not met) and writes nothing. That is expected and correct — it
+proves the node is wired. The real `ok` candle appears after a full trading day.
 
 ## Source of truth
 

@@ -15,8 +15,11 @@ generated from our own pipeline rather than scraped.
 
 Intended to run once in the EOD chain, right after the Fetch Market Summary
 node. Idempotent: re-running the same day recomputes and upserts the candle.
-If no samples were recorded today (market closed / ticks job did not run), it
-returns 'skipped' and writes nothing, so it never produces a garbage candle.
+
+Guard: a candle is only written when the day has enough samples spread across
+the session (see _MIN_SAMPLES / _MIN_SPAN_MINUTES). Too few (market closed, an
+off-hours manual test, or a day the ticks job barely ran) returns 'skipped' and
+writes nothing, so a flat/near-flat artifact never overwrites a real candle.
 """
 
 from __future__ import annotations
@@ -29,6 +32,14 @@ from dotenv import load_dotenv
 
 # Map index_ohlc.index_code -> index_ticks column.
 _INDEX_COLUMNS = {"DSEX": "dsex", "DS30": "ds30", "DSES": "dses"}
+
+# A candle is only meaningful if built from enough samples spread across the
+# session. Below these thresholds the data is a flat/near-flat artifact (e.g. an
+# off-hours manual test recording one tick, or a day the market-hours chain
+# barely ran), so we skip and write nothing rather than overwrite a real candle
+# with garbage. A normal trading day clears both easily.
+_MIN_SAMPLES = 4
+_MIN_SPAN_MINUTES = 30
 
 _UPSERT_SQL = (
     """
@@ -60,18 +71,32 @@ def rollup_index_ohlc() -> dict:
         cur.execute("SELECT CURRENT_DATE")
         today = cur.fetchone()[0]
 
-        # Total samples recorded today (any index column non-null).
+        # Sample count and the time span they cover. A real session produces
+        # many samples over hours; an artifact produces one or two close together.
         cur.execute(
-            "SELECT COUNT(*) FROM index_ticks WHERE date = %s",
+            """
+            SELECT COUNT(*),
+                   EXTRACT(EPOCH FROM (MAX(fetched_at) - MIN(fetched_at))) / 60.0
+            FROM index_ticks WHERE date = %s
+            """,
             (today,),
         )
-        sample_count = cur.fetchone()[0]
-        if sample_count == 0:
+        sample_count, span_minutes = cur.fetchone()
+        span_minutes = float(span_minutes or 0.0)
+
+        if sample_count < _MIN_SAMPLES or span_minutes < _MIN_SPAN_MINUTES:
             cur.close()
             return {
                 "status": "skipped",
-                "message": "No index_ticks recorded today; nothing to roll up.",
+                "message": (
+                    f"Not enough samples for a real candle "
+                    f"({sample_count} samples over {span_minutes:.0f} min; "
+                    f"need >={_MIN_SAMPLES} over >={_MIN_SPAN_MINUTES} min). "
+                    f"Nothing written."
+                ),
                 "date": today.isoformat(),
+                "samples_today": int(sample_count),
+                "span_minutes": round(span_minutes, 1),
             }
 
         # Total market volume for the day (index candle 'volume').
