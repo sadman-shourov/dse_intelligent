@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from ingestion.sync_stocks_master import sync_stocks_master
 from ingestion.append_price_history import append_price_history
+from ingestion.rollup_index_ohlc import rollup_index_ohlc
 from ingestion.ingest_live_ticks import ingest_live_ticks
 from ingestion.cleanup_live_ticks import cleanup_live_ticks
 from ingestion.fetch_market_summary import fetch_market_summary
@@ -205,6 +206,7 @@ def root():
             # Ingestion
             {"path": "/ingest/sync-stocks", "method": "POST", "description": "Sync stocks master from bdshare"},
             {"path": "/ingest/append-price-history", "method": "POST", "description": "Append today's price history for all symbols"},
+            {"path": "/ingest/index-ohlc-rollup", "method": "POST", "description": "Roll up today's index_ticks into self-generated index OHLC candle"},
             {"path": "/ingest/live-ticks", "method": "POST", "description": "Ingest current live ticks session"},
             {"path": "/ingest/cleanup-live-ticks", "method": "POST", "description": "Archive and clear today's live ticks"},
             {"path": "/ingest/market-summary", "method": "POST", "description": "Fetch and upsert market summary"},
@@ -270,6 +272,11 @@ def ingest_sync_stocks(request: Request):
 @app.post("/ingest/append-price-history")
 def ingest_append_price_history(request: Request):
     return _run_job(append_price_history)
+
+
+@app.post("/ingest/index-ohlc-rollup")
+def ingest_index_ohlc_rollup(request: Request):
+    return _run_job(rollup_index_ohlc)
 
 
 @app.post("/ingest/live-ticks")

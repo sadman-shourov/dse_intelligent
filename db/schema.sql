@@ -29,6 +29,43 @@ CREATE TABLE IF NOT EXISTS price_history (
 CREATE INDEX IF NOT EXISTS idx_price_history_symbol_date
     ON price_history(symbol, date DESC);
 
+-- Daily OHLC candles for market indices (DSEX, DS30, DSES).
+-- DSE does not publish index OHLC; sourced from stocknow's recorded series.
+-- `open` is a carried prior-close reference, not a true session open.
+CREATE TABLE IF NOT EXISTS index_ohlc (
+    id              BIGSERIAL PRIMARY KEY,
+    index_code      VARCHAR(10) NOT NULL,
+    date            DATE NOT NULL,
+    open            NUMERIC(12,4),
+    high            NUMERIC(12,4),
+    low             NUMERIC(12,4),
+    close           NUMERIC(12,4),
+    volume          BIGINT,
+    source          VARCHAR(20) DEFAULT 'stocknow',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(index_code, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_index_ohlc_code_date
+    ON index_ohlc(index_code, date DESC);
+
+-- Intraday index samples, appended every time fetch_market_summary runs during
+-- market hours. The EOD rollup turns each day's samples into one index_ohlc
+-- candle (open=first, high=max, low=min, close=last). Lets us self-generate
+-- index candles from our own pipeline instead of scraping a third party.
+CREATE TABLE IF NOT EXISTS index_ticks (
+    id              BIGSERIAL PRIMARY KEY,
+    date            DATE NOT NULL,
+    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    dsex            NUMERIC(12,4),
+    ds30            NUMERIC(12,4),
+    dses            NUMERIC(12,4),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_index_ticks_date
+    ON index_ticks(date, fetched_at);
+
 CREATE TABLE IF NOT EXISTS live_ticks (
     id              BIGSERIAL PRIMARY KEY,
     symbol          VARCHAR(20) NOT NULL REFERENCES stocks_master(symbol),

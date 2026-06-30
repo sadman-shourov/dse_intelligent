@@ -143,6 +143,21 @@ def fetch_market_summary() -> dict:
             upsert_sql,
             (today_str, total_trade, total_volume, total_value_mn, total_mcap_mn, dsex_index, dses_index, ds30_index),
         )
+
+        # Append an intraday index sample for self-generated OHLC candles.
+        # Isolated: a failure here (e.g. table missing) must never break the
+        # market_summary upsert above. conn.autocommit is True, so the failed
+        # statement is its own transaction and does not poison the connection.
+        try:
+            cur.execute(
+                """
+                INSERT INTO index_ticks (date, fetched_at, dsex, ds30, dses)
+                VALUES (%s, NOW(), %s, %s, %s)
+                """,
+                (today_str, dsex_index, ds30_index, dses_index),
+            )
+        except Exception as tick_exc:  # noqa: BLE001
+            print(f"index_ticks insert skipped: {tick_exc}")
     finally:
         cur.close()
         conn.close()
